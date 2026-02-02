@@ -86,7 +86,11 @@ After extracting the DAB Compliance Test Suite, you DO NOT need to manually conf
 
   The following is command to run Spec conformance Test Suite:
   ```
-  ❯ python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id> -s "conformance"
+  ❯ python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id> -s conformance
+  ```
+  Command for testing Functional tests:
+  ```
+  ❯ python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id> -s functional
   ```
 
 
@@ -96,7 +100,7 @@ These are the main commands of the tool:
 
 ```
 python3 main.py --help
-usage: main.py [-h] [-v] [-l] [-b BROKER] [-I ID] [-c CASE] [-o OUTPUT] [-s SUITE] [--dab-version {2.0,2.1}] [--init]
+usage: main.py [-h] [-v] [-l] [-b BROKER] [-I ID] [-c CASE] [-o OUTPUT] [-s SUITE] [--dab-version {2.0,2.1}] [--init] [--config-app CONFIG_APP] [--config-va CONFIG_VA] [--config-show]
 
 options:
   -h, --help            show this help message and exit
@@ -113,7 +117,11 @@ options:
   --dab-version {2.0,2.1}
                         Override detected DAB version. Use 2.0 or 2.1 to force specific test compatibility.
   --init                Interactive setup: prompt for app paths (and optional store URL), then exit.
-
+  --config-app CONFIG_APP
+                        Update runtime apps mapping and exit. Repeat: --config-app key=value
+  --config-va CONFIG_VA
+                        Update runtime VA and exit. Example: --config-va GoogleAssistant
+  --config-show         Print current runtime config and exit.
 ```
 
 ## Command Examples ##
