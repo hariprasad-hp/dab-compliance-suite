@@ -8,7 +8,7 @@ This project contains tools and tests for end-to-end validation of Device Automa
 
 The latest DAB Compliance Test Suite can be downloaded from the GitHub Actions workflow.
 
-Download [Link](https://github.com/device-automation-bus/dab-compliance-suite/actions)
+Download the latest artifact here: [Link](https://nightly.link/device-automation-bus/dab-compliance-suite/workflows/update-test-version/main/dab-compliance-suite.zip)
 
 
 ## Test Versioning ##
@@ -43,7 +43,7 @@ Each time you push code to the 'main' branch, a version number is created automa
 - You can download it from GitHub → Actions → Artifacts.
 
 ## Prerequisite ##
-Python minimal version 3.8
+Python minimal version 3.10
 
 Please edit config.py to have the device app line up with your system settings.
 
@@ -51,30 +51,75 @@ Please edit config.py to have the device app line up with your system settings.
 pip3 install -r requirements.txt
 ```
 
-### Automatic App Setup Instructions  ###
+### Ubuntu 23.04+ ###
 
-After extracting the DAB Compliance Test Suite, you DO NOT need to manually configure the APK or App Store URL.
+On Ubuntu 23.04 and later, `pip` installation into the system Python may fail because the Python environment is externally managed.
 
-1. Run your CLI with --init
-   Example:
-   python3 main.py --init
+Use a virtual environment instead:
 
-2. Application Setup:
-   - The tool will check if Sample_App (application file) exists in config/apps/
-   - If missing, it will prompt:
-       "Full path to the application file (.apk or .apks):"
-   - Enter the absolute path to your application file.
-   - The tool will copy it into config/apps/ and rename to Sample_App.<ext>
+```bash
+sudo apt install python3-venv
+python3 -m venv ~/.venv/dab-compliance-suite
+~/.venv/dab-compliance-suite/bin/pip3 install -r requirements.txt
+~/.venv/dab-compliance-suite/bin/python3 main.py --help
+```
 
-3. App Store URL Setup:
-   - The tool will check if config/apps/sample_app.json exists.
-   - If missing, it will prompt:
-       "Enter App Store URL for install-from-app-store tests:"
-   - Paste the Play Store (or App Store) URL.
-   - The tool saves it into config/apps/sample_app.json
+Or activate it with `source`:
 
-4. Done!
-   - only need to run --init again if you want to replace applications or URLs.
+```bash
+source ~/.venv/dab-compliance-suite/bin/activate
+pip3 install -r requirements.txt
+python3 main.py --help
+```
+
+Run the suite using the virtual environment Python:
+
+```bash
+~/.venv/dab-compliance-suite/bin/python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id>
+```
+
+If you activated the environment with `source`, you can run:
+
+```bash
+python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id>
+```
+
+### Application and App Store Setup ###
+
+The DAB Compliance Test Suite is generic. It cannot hardcode one fixed app,
+APK, app store, or store URL for every Device Under Test (DUT).
+
+Choose an app package that your DUT platform can install and remove safely.
+Android TV and Google TV users can provide a valid APK or APKS package. Other
+platforms must provide an application package in a format supported by that
+platform.
+
+Run the setup command:
+
+```bash
+python3 main.py --init
+```
+
+The setup flow collects:
+
+1. Full path to the DUT-compatible application package.
+2. App store URL for install-from-app-store tests, if needed.
+
+For complete app setup details, see [Application and App Store Setup Guide](docs/app-setup/README.md).
+
+### Runtime Install Bridge ###
+
+For local `applications/install` flows, the suite opens a temporary FastAPI bridge
+that serves the configured app artifact from `config/apps/` only when the test is
+applicable.
+
+- The bridge is not started from `main.py`.
+- It is used only for the install test, then stopped automatically.
+- Default bind address: `0.0.0.0`
+- Preferred port: `8765`
+- If `8765` is already in use, the suite picks the next free port and logs that choice instead of failing hard.
+- If the app artifact is missing for an applicable install test, run `python3 main.py --init` or place the correct DUT-compatible app package under `config/apps/`.
+- If the DUT is DAB 2.0 or does not support `applications/install`, the test should be marked `OPTIONAL_FAILED` and should not wait for an app artifact.
 
 
 ## Available Test Suite ##
@@ -86,7 +131,7 @@ After extracting the DAB Compliance Test Suite, you DO NOT need to manually conf
 
   The following is command to run Spec conformance Test Suite:
   ```
-  ❯ python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id> -s "conformance"
+  python3 main.py -v -b <mqtt-broker-ip> -I <dab-device-id> -s conformance
   ```
 
 

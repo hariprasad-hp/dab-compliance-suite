@@ -45,15 +45,15 @@ class RunLogger:
     def _style_ts(self, ts: str) -> str:
         if not self.enable_color or not _supports_color():
             return ts
-        # brighter light gray: bright white + dim
-        return f"{DIM}{FG_BWHITE}{ts}{RESET}"
+        # Using only DIM dims the terminal's default text color (gray on dark, dark gray on light backgrounds)
+        return f"{DIM}{ts}{RESET}"
 
     def _style_msg(self, level: str, msg: str, always: bool) -> str:
         if not self.enable_color or not _supports_color():
             return msg
         if not always:
-            # verbose-only lines: “smaller” but a bit brighter 
-            return f"{DIM}{ITAL}{FG_BWHITE}  · {msg}{RESET}"
+            # verbose-only lines: dim and italicized
+            return f"{DIM}{ITAL}  · {msg}{RESET}"
         # always-on lines: brighter/bolder
         if level == "WARN":
             return f"{BOLD}{FG_YELLOW}{msg}{RESET}"
@@ -64,7 +64,7 @@ class RunLogger:
         if level == "PROMPT":
             return f"{BOLD}{FG_MAGENTA}{msg}{RESET}"
         if level == "RESULT":
-            return f"{BOLD}{FG_BWHITE}{msg}{RESET}"
+            return f"{BOLD}{msg}{RESET}"
         if level == "OK":
             return f"{BOLD}{FG_GREEN}{msg}{RESET}"
         return f"{BOLD}{msg}{RESET}"

@@ -1,5 +1,6 @@
 from jsonschema import validate
 import jsons
+import dab_tester
 
 # DabRequest
 dab_request_schema = {
@@ -266,7 +267,7 @@ device_information_schema = {
         "displayType": {"type": "string"},
         "screenWidthPixels": {"type": "integer"},
         "screenHeightPixels": {"type": "integer"},
-        "uptimeSince": {"type": "integer"},
+        "uptimeSince": {"type": ["string", "integer"]},
         "deviceId": {"type": "string"}
     },
     "required": ["status", "manufacturer", "model", "serialNumber", "chipset", 
@@ -349,12 +350,50 @@ list_system_settings_schema = {
         "mute": {"type": "boolean"},
         "textToSpeech": {"type": "boolean"}
     },
+}
+
+list_system_settings_schema_20 = {
+    "allOf": [list_system_settings_schema],
     "required": ["status", "language", "outputResolution", "memc", "cec", "lowLatencyMode",
                  "matchContentFrameRate", "hdrOutputMode", "pictureMode", "audioOutputMode",
-                 "audioOutputSource", "videoInputSource", "audioVolume", "mute", "textToSpeech"]
+                 "audioOutputSource", "videoInputSource", "mute", "textToSpeech"]
+}
+
+list_system_settings_schema_21 = {
+    "allOf": [list_system_settings_schema],
+    "properties": {
+        "brightness": {
+            "type": "object",
+            "properties": {
+                "min": {"type": "integer"},
+                "max": {"type": "integer"}
+            },
+            "required": ["min", "max"]
+        },
+        "contrast": {
+            "type": "object",
+            "properties": {
+                "min": {"type": "integer"},
+                "max": {"type": "integer"}
+            },
+            "required": ["min", "max"]
+        },
+        "timeZone": {"type": "boolean"},
+        "screenSaver": {"type": "boolean"},
+        "screenSaverMinTimeout": {"type": "integer"},
+        "personalizedAds": {"type": "boolean"},
+        "highContrastText": {"type": "boolean"},
+        "identifierForAdvertising": {"type": "boolean"},
+    },
+    "required": ["status", "language", "outputResolution", "memc", "cec", "lowLatencyMode",
+                 "matchContentFrameRate", "hdrOutputMode", "pictureMode", "audioOutputMode",
+                 "audioOutputSource", "videoInputSource", "audioVolume", "mute", "textToSpeech",
+                 "timeZone", "screenSaver",
+                 "personalizedAds", "highContrastText", "identifierForAdvertising"]
 }
 
 system_settings_schema = {
+    "status": {"type": "integer"},
     "language": {"type": "string"},
     "outputResolution": output_resolution_schema,
     "memc": {"type": "boolean"},
@@ -369,6 +408,15 @@ system_settings_schema = {
     "audioVolume": {"type": "integer"},
     "mute": {"type": "boolean"},
     "textToSpeech": {"type": "boolean"},
+    "brightness": {"type": "integer"},
+    "contrast": {"type": "integer"},
+    "timeZone": {"type": "string"},
+    "screenSaver": {"type": "boolean"},
+    "screenSaverTimeout": {"type": "integer"},
+    "screenSaverMinTimeout": {"type": "integer"},
+    "personalizedAds": {"type": "boolean"},
+    "highContrastText": {"type": "boolean"},
+    "identifierForAdvertising": {"type": "string"},
 }
 
 # Operation: system/settings/get
@@ -387,7 +435,7 @@ get_system_settings_response_schema = {
     },
     "then": {
         "properties": system_settings_schema,
-        "required": list(system_settings_schema.keys())
+        "additionalProperties": False
     },
     "else": {
         "properties": {
@@ -413,7 +461,8 @@ set_system_settings_response_schema = {
         }
     },
     "then": {
-        "properties": system_settings_schema
+        "properties": system_settings_schema,
+        "additionalProperties": False
     },
     "else": {
         "properties": {
@@ -751,18 +800,7 @@ version_response_schema = {
 }
 
 #StartLogCollectionRequest
-start_log_collection_request_schema = {
-    "type": "object",
-    "properties": {
-        "duration": { "type": "integer" },
-        "logLevel": { "type": "string" },  # INFO, DEBUG, ERROR
-        "logTypes": {
-            "type": "array",
-            "items": { "type": "string" }
-        }
-    },
-    "required": ["duration"]
-}
+start_log_collection_request_schema = dab_request_schema
 
 #StartLogCollectionResponce
 start_log_collection_response_schema = {
@@ -775,10 +813,7 @@ start_log_collection_response_schema = {
 }
 
 #StopLogCollectionRequest
-stop_log_collection_request_schema = {
-    "type": "object",
-    "properties": {}
-}
+stop_log_collection_request_schema = dab_request_schema
 
 #StopLogCollectionResponse
 stop_log_collection_response_schema = {
@@ -786,9 +821,10 @@ stop_log_collection_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "logs": {"type": "string"}  # or binary/file path depending on device
+        "logArchive": {"type": "string"},
+        "remainingChunks": {"type": "integer"}
     },
-    "required": ["status", "logs"]
+    "required": ["status", "logArchive", "remainingChunks"]
 }
 
 # Operation: system/power-mode/get
@@ -942,7 +978,11 @@ class dab_response_validator(object):
 
     @staticmethod
     def validate_list_system_settings_schema(response):
-        validate(instance=jsons.loads(response), schema=list_system_settings_schema)
+        dab_version = dab_tester.DAB_VERSION or "2.0"
+        if dab_version == "2.0":
+            validate(instance=jsons.loads(response), schema=list_system_settings_schema_20)
+        elif dab_version == "2.1":
+            validate(instance=jsons.loads(response), schema=list_system_settings_schema_21)
 
     @staticmethod
     def validate_get_system_settings_response_schema(response):

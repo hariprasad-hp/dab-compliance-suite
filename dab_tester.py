@@ -13,9 +13,13 @@ import os
 from util.enforcement_manager import EnforcementManager
 from util.enforcement_manager import ValidateCode
 from util.config_loader import resolve_body_or_raise, PayloadConfigError
+from util.output_image_handler import handle_output_image_response
 from sys import exit as sys_exit
 import re
-import time  
+import time
+from packaging.version import Version, InvalidVersion
+
+DAB_VERSION = "2.0" # default dab version is 2.0, this global value will be used in system/settings/... operations.
 
 # Raised when preflight (discovery/health) decides we should stop the run.
 class PreflightTermination(Exception):
@@ -71,10 +75,24 @@ class DabTester:
         log(tr, f"[REASON] {reason}")
         return tr
 
+    def _result_before_payload(self, outcome: str, device_id: str, topic: str, title: str, reason: str, extra_logs: list = None):
+        """Return a TestResult directly before payload resolution."""
+        test_id = to_test_id(f"{topic}/{title}")
+        tr = TestResult(test_id, device_id, topic, "{}", outcome, "", [])
+        tr.test_result = outcome
+        self.logger.warn(f"[{outcome}] {title} (test_id={test_id}) - {reason}")
+        log(tr, f"[TEST] {title} (test_id={test_id}, device={device_id})")
+        for line in extra_logs or []:
+            if line:
+                log(tr, line)
+        log(tr, f"[REASON] {reason}")
+        return tr
+
     def _resolve_body_or_skip(self, device_id: str, topic: str, title: str, body_spec):
         """
-        Build the request body. If it fails (e.g., missing APK/App Store URL),
-        return a SKIPPED TestResult with a precise reason and hint.
+        Build the request body. If it fails, return a SKIPPED or OPTIONAL_FAILED TestResult.
+        - For DAB 2.0, app install failures become OPTIONAL_FAILED.
+        - For all other cases, failures become SKIPPED.
         Returns: (ok: bool, body_str: Optional[str], tr_if_skipped: Optional[TestResult])
         """
         test_id = to_test_id(f"{topic}/{title}")
@@ -83,21 +101,22 @@ class DabTester:
             return True, body_str, None
         except PayloadConfigError as e:
             reason = str(e)
+            outcome = "SKIPPED"
             hint = getattr(e, "hint", "")
+            log_msg = f"[{outcome}] {test_id} — payload/config missing: {reason}."
             if hint:
-                self.logger.warn(f"[SKIPPED] {test_id} — payload/config missing: {reason}. {hint}")
-            else:
-                self.logger.warn(f"[SKIPPED] {test_id} — payload/config missing: {reason}.")
+                log_msg += f" {hint}"
+            self.logger.warn(log_msg)
 
-            tr = TestResult(test_id, device_id, topic, "{}", "SKIPPED", "", [])
-            tr.test_result = "SKIPPED"  # ensure it’s counted in results
+            tr = TestResult(test_id, device_id, topic, "{}", outcome, "", [])
+            tr.test_result = outcome
             log(tr, f"[TEST] {title} (test_id={test_id}, device={device_id})")
             log(tr, "[DESC] Skipped because request payload could not be generated.")
             log(tr, f"[REASON] {reason}")
             if hint:
                 log(tr, f"[HINT] {hint}")
-            return False, None, tr
 
+            return False, None, tr
     # -----------------------------
     # Preflight helpers
     # “Preflight” just means the quick checks we run before a test starts—like an aviation pre-flight checklist.
@@ -393,6 +412,45 @@ class DabTester:
 
         test_id = to_test_id(f"{dab_request_topic}/{test_title}")
 
+        # Run applicability checks before resolving payloads that may have side effects.
+        if not self.dab_version:
+            self.detect_dab_version(device_id)
+
+        dab_version = self.dab_version or "2.0"
+
+        try:
+            if Version(dab_version) < Version(test_version):
+                reason = f"\033[1;33m[ OPTIONAL_FAILED - Requires DAB Version {test_version}, but device version is {dab_version} ]\033[0m"
+                return self._result_before_payload(
+                    outcome="OPTIONAL_FAILED",
+                    device_id=device_id,
+                    topic=dab_request_topic,
+                    title=test_title,
+                    reason=reason,
+                )
+        except InvalidVersion as e:
+            self.logger.warn(f"[WARNING] Version comparison failed (invalid version string): {e}")
+
+        if dab_request_topic != "operations/list":
+            validate_code, prechecker_log = self.dab_checker.is_operation_supported(
+                device_id,
+                dab_request_topic,
+            )
+            unsupported = validate_code == ValidateCode.UNSUPPORT
+            uncertain_install = dab_request_topic == "applications/install" and validate_code == ValidateCode.UNCERTAIN
+            if unsupported or uncertain_install:
+                reason = "\033[1;33m[ OPTIONAL_FAILED - Required DAB Operation is NOT SUPPORTED by this device ]\033[0m"
+                if uncertain_install:
+                    reason = "\033[1;33m[ OPTIONAL_FAILED - Required DAB Operation support could not be confirmed by this device ]\033[0m"
+                return self._result_before_payload(
+                    outcome="OPTIONAL_FAILED",
+                    device_id=device_id,
+                    topic=dab_request_topic,
+                    title=test_title,
+                    reason=reason,
+                    extra_logs=[prechecker_log],
+                )
+
         # Try to build/resolve payload. If it fails, return a SKIPPED TestResult (no test_start)
         ok, dab_request_body, skipped_tr = self._resolve_body_or_skip(device_id, dab_request_topic, test_title, body_spec)
         if not ok:
@@ -420,41 +478,27 @@ class DabTester:
 
             # Initialize result object for logging and reporting
             test_result = TestResult(to_test_id(f"{dab_request_topic}/{test_title}"), device_id, dab_request_topic, dab_request_body, "UNKNOWN", "", [])
-            # ------------------------------------------------------------------------
-            # DAB Version Compatibility Check
-            # If the test is meant for DAB 2.1 but the dav version is on DAB 2.0,
-            # treat this as OPTIONAL_FAILED instead of skipping or erroring out.
-            # This ensures transparency in test result reporting.
-            # ------------------------------------------------------------------------
-            # Get dab version version (default "2.0") and convert both to float
-            dab_version = self.dab_version or "2.0"
-            required_version = float(test_version)
 
-            # If the required test version > current dab version, mark as OPTIONAL_FAILED
+            # ------------------------------------------------------------------------
+            # Capability filter 
+            # Gate topics that depend on settings lists. If unsupported ⇒ OPTIONAL_FAILED.
+            # Uses dab_checker.precheck(...) so it can consult system/settings/list.
+            # Runs for both positive and negative tests (keeps rest of logic intact).
+            # ------------------------------------------------------------------------
             try:
-                required_version = float(test_version)
-                dab_version_float = float(dab_version)
-                if dab_version_float < required_version:
-                    test_result.test_result = "OPTIONAL_FAILED"
-                    log(test_result, f"\033[1;33m[ OPTIONAL_FAILED - Requires DAB Version {required_version}, but DAB version is {dab_version_float} ]\033[0m")
-                    # close section before returning
-                    total_ms = int((time.time() - section_wall_start) * 1000)
-                    self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
-                    return test_result
-            except Exception as e:
-                log(test_result, f"[WARNING] Version comparison failed: {e}")
-
-            # Check operation support via operations/list (prechecker)
-            if dab_request_topic != 'operations/list':
-                validate_code, prechecker_log = self.dab_checker.is_operation_supported(device_id, dab_request_topic)
-
-                if validate_code == ValidateCode.UNSUPPORT:
-                    test_result.test_result = "OPTIONAL_FAILED"
-                    log(test_result, prechecker_log)
-                    log(test_result, f"\033[1;33m[ OPTIONAL_FAILED - Requires DAB Operation is NOT SUPPORTED ]\033[0m")
-                    total_ms = int((time.time() - section_wall_start) * 1000)
-                    self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
-                    return test_result
+                if dab_request_topic in {"system/settings/set"}:
+                    vc, cap_log = self.dab_checker.precheck(device_id, dab_request_topic, dab_request_body)
+                    if vc == ValidateCode.UNSUPPORT:
+                        test_result.test_result = "OPTIONAL_FAILED"
+                        if cap_log:
+                            log(test_result, cap_log)
+                        log(test_result, "\033[1;33m[ OPTIONAL_FAILED - Unsupported by device capability lists ]\033[0m")
+                        total_ms = int((time.time() - section_wall_start) * 1000)
+                        self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
+                        return test_result
+            except Exception:
+                # do not alter flow on capability check errors; continue to existing checks
+                pass
 
             # ------------------------------------------------------------------------
             # If precheck is supported and this is not a negative test case
@@ -478,7 +522,18 @@ class DabTester:
                 # Send DAB request via broker
                 try:
                     code = self.execute_cmd(device_id, dab_request_topic, dab_request_body)
-                    test_result.response = self.dab_client.response()
+                    resp_text = self.dab_client.response() or ""
+                    status_code = self.dab_client.last_error_code()
+                    test_result.response = resp_text
+                    # Topics whose responses are big/noisy (don’t store full response in JSON)
+                    HEAVY_TOPICS = {"system/logs/stop-collection", "output/image"}
+                    if dab_request_topic in HEAVY_TOPICS:
+                        outcome = "SUCCESS" if status_code == 200 else f"ERROR {status_code}"
+                        log(test_result, f"[INFO] Response summary for '{dab_request_topic}': HTTP {status_code} ({outcome})")
+                    else:
+                        # For normal topics, keep existing behavior
+                        test_result.response = resp_text
+
                 except Exception as e:
                     test_result.test_result = "SKIPPED"
                     log(test_result, f"\033[1;34m[ SKIPPED - Internal Error During Execution ]\033[0m {str(e)}")
@@ -567,9 +622,71 @@ class DabTester:
             except Exception as e:
                 test_result.test_result = "SKIPPED"
                 log(test_result, f"\033[1;34m[ SKIPPED - Internal Error ]\033[0m {str(e)}")
+            if dab_request_topic not in {"system/logs/stop-collection", "output/image"} and resp_text:
+                try:
+                    text = str(resp_text)  # no trimming
 
-            if self.verbose and test_result.test_result != "SKIPPED":
-                log(test_result, test_result.response)
+                    # If response looks like "['{', 'status: 200', ...]" try to merge it to JSON text
+                    if text.startswith('[') and text.endswith(']'):
+                        import ast
+                        try:
+                            chunks = ast.literal_eval(text)
+                            if isinstance(chunks, list):
+                                text = " ".join(str(x) for x in chunks if str(x))
+                        except Exception:
+                            pass
+
+                    obj = json.loads(text)
+
+                    if isinstance(obj, dict):
+                        for key, value in obj.items():
+                            if isinstance(value, list):
+                                # No index for sub-items; print one line per value
+                                for item in value:
+                                    log(test_result, f"{key}: {item}")
+                            elif isinstance(value, dict):
+                                # Flatten one level without indices
+                                for sub_key, sub_val in value.items():
+                                    log(test_result, f"{key}.{sub_key}: {sub_val}")
+                            else:
+                                log(test_result, f"{key}: {value}")
+
+                    elif isinstance(obj, list):
+                        # Index only for the MAIN (top-level) list items
+                        for i, item in enumerate(obj):
+                            if isinstance(item, dict):
+                                for key, value in item.items():
+                                    if isinstance(value, list):
+                                        for sub_item in value:
+                                            log(test_result, f"item[{i}].{key}: {sub_item}")  # no sub-index
+                                    elif isinstance(value, dict):
+                                        for sub_key, sub_val in value.items():
+                                            log(test_result, f"item[{i}].{key}.{sub_key}: {sub_val}")  # no sub-index
+                                    else:
+                                        log(test_result, f"item[{i}].{key}: {value}")
+                            elif isinstance(item, list):
+                                # Nested list: repeat the same main index for each inner value (no sub-index)
+                                for sub_item in item:
+                                    log(test_result, f"item[{i}]: {sub_item}")
+                            else:
+                                log(test_result, f"item[{i}]: {item}")
+
+                    else:
+                        # Primitive (str/number/bool/null)
+                        log(test_result, str(obj))
+
+                except Exception:
+                    # Fallbacks: if we had chunk tokens, print each as a separate line; else raw text
+                    try:
+                        if 'chunks' in locals() and isinstance(chunks, list):
+                            for chunk in chunks:
+                                log(test_result, str(chunk))
+                        else:
+                            log(test_result, resp_text)
+                    except Exception:
+                        log(test_result, resp_text)
+
+
 
             # ---------- close the test section ----------
             total_ms = int((time.time() - section_wall_start) * 1000)
@@ -579,6 +696,13 @@ class DabTester:
             return test_result
 
         finally:
+            if dab_request_topic == "applications/install":
+                try:
+                    from util.runtime_api_server import stop_runtime_install_bridge
+
+                    stop_runtime_install_bridge()
+                except Exception:
+                    pass
             # Always try to go back Home after the test, regardless of outcome/early return/exception.
             try:
                 self.return_to_home_after_test(device_id)
@@ -589,18 +713,25 @@ class DabTester:
     def Execute_Functional_Tests(self, device_id, functional_tests, test_result_output_path=""):
         """
         Functional runner that mirrors conformance preflight:
-        - For EACH test: run discovery + health-check (via _preflight_before_each_test_or_raise)
+        - For EACH test: run DAB version check, then discovery + health-check.
         - If preflight fails once, mark current + remaining as SKIPPED and stop.
         """
         result_list = []
         terminated_run = False
         total_count = len(functional_tests)
         suite_wall_start = time.time()
+        dab_version = self.dab_version  # Get the device's DAB version once
+
         for idx, test_case in enumerate(functional_tests, 1):
             try:
-                dab_topic, test_category, test_func, test_name, *_ = test_case
+                # Updated tuple unpacking to include the test_version
+                dab_topic, test_category, test_func, test_name, test_version, *_ = test_case
+            except ValueError:
+                # Handle older test case definitions without a version
+                dab_topic, test_category, test_func, test_name = test_case[:4]
+                test_version = "2.0"  # Default to a version that will always pass
             except Exception:
-                dab_topic, test_category, test_func, test_name = ("unknown/topic", "functional", None, "Unknown")
+                dab_topic, test_category, test_func, test_name, test_version = ("unknown/topic", "functional", None, "Unknown", "2.0")
 
             # progress line (like conformance)
             pretty_name = test_name if isinstance(test_name, str) and test_name.strip() else f"{dab_topic}/{test_category}"
@@ -619,6 +750,24 @@ class DabTester:
             section_wall_start = time.time()
             outcome_for_end = "SKIPPED"  # default if we bail early
             # --------------------------------------------------
+
+            # MODIFIED: Use packaging.version for robust comparison
+            try:
+                if Version(dab_version) < Version(test_version):
+                    outcome_for_end = "OPTIONAL_FAILED"
+                    log_msg = f"[OPTIONAL_FAILED] Requires DAB Version {test_version}, but device version is {dab_version}. Skipping test."
+                    self.logger.warn(log_msg)
+                    tr = TestResult(
+                        test_id, device_id, dab_topic, "{}", outcome_for_end, "",
+                        [log_msg]
+                    )
+                    result_list.append(tr)
+                    total_ms = int((time.time() - section_wall_start) * 1000)
+                    self.logger.test_end(outcome=outcome_for_end, duration_ms=total_ms)
+                    continue  # Skip to the next test in the loop
+            except InvalidVersion as e:
+                # Log a warning but allow the test to proceed if versions are malformed
+                self.logger.warn(f"[WARNING] Could not compare DAB versions (required: '{test_version}', device: '{dab_version}'): {e}")
 
             try:
                 # preflight (may raise PreflightTermination)
@@ -655,7 +804,7 @@ class DabTester:
                 if callable(test_func):
                     result = None
                     try:
-                        result = test_func(dab_topic, test_category, pretty_name, self, device_id)
+                        result = test_func(dab_topic, pretty_name, self, device_id)
                         # Ensure we always append a TestResult-like object
                         if result is None:
                             result = TestResult(
@@ -699,6 +848,13 @@ class DabTester:
                 )
                 result_list.append(tr)
                 outcome_for_end = "SKIPPED"
+
+            try:
+                from util.runtime_api_server import stop_runtime_install_bridge
+
+                stop_runtime_install_bridge()
+            except Exception:
+                pass
 
             # --- close the test section (mirrors conformance) ---
             total_ms = int((time.time() - section_wall_start) * 1000)
@@ -802,6 +958,7 @@ class DabTester:
         """
         if not output_path:
             output_path = f"./test_result/{suite_name}.json"
+        os.environ["DAB_RESULTS_JSON"] = os.path.abspath(output_path)
 
         def _outcome_of(r):
             return getattr(r, "test_result", None) or getattr(r, "outcome", None) or ""
@@ -818,8 +975,75 @@ class DabTester:
             except Exception:
                 self.logger.warn(f"An invalid result object was skipped in the JSON writer: {r}")
 
-        # Clean only valid results so what we write is tidy
-        self.clean_result_fields(valid_results, fields_to_clean=["logs", "request", "response"])
+            # --- Summarize heavy topics (no artifact saving here) ---
+            HEAVY_TOPICS = {"system/logs/stop-collection", "output/image"}
+
+            for r in valid_results:
+                topic = getattr(r, "operation", "") or getattr(r, "topic", "")
+                if topic not in HEAVY_TOPICS:
+                    continue
+
+                # Parse response to dict (best-effort) for status summarization
+                resp_raw = getattr(r, "response", None)
+
+                # NEW: if response is already a list, summarize by length and skip parsing
+                if isinstance(resp_raw, list):  # e.g., old runs that tokenized the body
+                    setattr(r, "response", f"Response summary for '{topic}': list with {len(resp_raw)} items")
+                else:
+                    if isinstance(resp_raw, dict):
+                        resp_obj = resp_raw
+                    elif isinstance(resp_raw, str) and resp_raw.strip():
+                        try:
+                            resp_obj = json.loads(resp_raw)
+                        except Exception:
+                            resp_obj = {}
+                    else:
+                        resp_obj = {}
+
+                    # Build concise summary (no big payloads in results.json)
+                    status = resp_obj.get("status") if isinstance(resp_obj, dict) else None
+                    if isinstance(status, int):
+                        outcome = "SUCCESS" if status == 200 else f"ERROR {status}"
+                        summary = f"Response summary for '{topic}': HTTP {status} ({outcome})"
+                    else:
+                        summary = f"Response summary for '{topic}': stored artifact; see logs."
+                    setattr(r, "response", summary)
+                # Ensure a logs list exists; reference any path that the step saved
+                try:
+                    if not hasattr(r, "logs") or r.logs is None:
+                        setattr(r, "logs", [])
+                    saved_path = getattr(r, "saved_image_path", None)
+                    if topic == "output/image" and saved_path:
+                        r.logs.append(f"[INFO] Screenshot (from step): {saved_path}")
+                except Exception:
+                    pass
+                # NEW: scrub any previously-added response lines from logs for heavy topics
+                # (keeps only non-response lines, like the screenshot info above)
+                try:
+                    if hasattr(r, "logs") and isinstance(r.logs, list):
+                        cleaned = []
+                        for ln in r.logs:
+                            # keep non-strings (dict/list), and non-response info lines
+                            if not isinstance(ln, str):
+                                cleaned.append(ln); continue
+                            s = ln.lstrip()
+                            # Remove only raw response previews (JSON-ish), not our structured log tags like [TEST]/[INFO]/[PASS].
+                            if s.startswith("{") or s.startswith("status:") or s.startswith("[RESPONSE"):
+                                continue
+                            if s.startswith("item[") or s.startswith("items["):
+                                continue
+                            # Only drop JSON-like arrays, not log tags.
+                            if s.startswith("[{") or s.startswith('["') or (len(s) > 1 and s[0] == "[" and s[1].isdigit()):
+                                continue
+                            cleaned.append(ln)
+                        r.logs = cleaned
+                except Exception:
+                    pass
+
+        # -------------------------------------------------------------------------------
+
+        # Clean only valid results so what we write is tidy (keep logs!)
+        self.clean_result_fields(valid_results, fields_to_clean=["request", "response"])
 
         # Counts must match what we write
         total = len(valid_results)
@@ -939,8 +1163,10 @@ class DabTester:
         Stores version string in self.dab_version.
         Honors override_dab_version if explicitly provided.
         """
+        global DAB_VERSION
         if hasattr(self, 'override_dab_version') and self.override_dab_version:
             self.dab_version = self.override_dab_version
+            DAB_VERSION = self.dab_version
             self.logger.info(f"Using the forced DAB version override: {self.dab_version}.")
             return
         try:
@@ -950,6 +1176,7 @@ class DabTester:
             if response:
                 resp_json = json.loads(response)
                 self.dab_version = resp_json.get("DAB Version", "2.0")
+                DAB_VERSION = self.dab_version
                 self.logger.info(f"DAB version detected: {self.dab_version}.")
             else:
                 self.logger.warn("The DAB version check returned an empty response. Defaulting to 2.0.")
@@ -1076,7 +1303,6 @@ class DabTester:
     def Close(self):
         self.dab_client.disconnect()
 
-
 def Default_Validations(test_result, durationInMs=0, expectedLatencyMs=0):
     sleep(0.2)
     log(test_result, f"\n{test_result.operation} Latency, Expected: {expectedLatencyMs} ms, Actual: {durationInMs} ms\n")
@@ -1094,17 +1320,34 @@ def get_test_tool_version():
 
 def log(test_result, str_print):
     """
-    Normalizes any incoming text (even if it has leading/trailing newlines),
-    prints each non-empty line via the unified LOGGER with a timestamp,
-    and stores the stamped line into test_result.logs.
+    Print to console (with color), but store a cleaned line in result.logs:
+    - Strip any leading timestamp and [LEVEL] tag
+    - Remove ANSI escape sequences (so no \\u001b... in JSON)
     """
+    # Timestamp + optional [LEVEL] tag at the start of the line
+    ts_re = re.compile(
+        r'^\s*'                                   # leading spaces
+        r'(?:\d{4}-\d{2}-\d{2}[ T]'               # date + space or T
+        r'\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*)?'       # time(.ms) (optional)
+        r'(?:\[[A-Z]+\]\s*)?'                     # optional [LEVEL] tag
+    )
+    # ANSI escape sequences (e.g., \x1b[36m) — shown as \u001b in JSON
+    ansi_re = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
     s = str(str_print).replace("\r\n", "\n")
     for raw in s.split("\n"):
         line = raw.strip()
         if not line:
-            continue 
-        LOGGER.result(line)                  # console with timestamp
-        test_result.logs.append(LOGGER.stamp(line))  # persist stamped line
+            continue
+        # Console: keep original (colors preserved by LOGGER)
+        LOGGER.result(line)
+        # JSON: strip timestamp/level + ANSI codes
+        try:
+            clean = ts_re.sub("", line)
+            clean = ansi_re.sub("", clean)
+            clean = clean.strip()
+        except Exception:
+            clean = line
+        test_result.logs.append(clean)
 
 def YesNoQuestion(test_result, question=""):
     positive = ['yes', 'y']

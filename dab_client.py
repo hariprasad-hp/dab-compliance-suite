@@ -5,6 +5,8 @@ from paho.mqtt.packettypes import PacketTypes
 import paho.mqtt.client as mqtt
 import json
 import uuid
+from logger import LOGGER 
+from util.argument_validator import handle_connection_error
 
 METRICS_TIMES = 5
 
@@ -15,6 +17,8 @@ class DabClient:
         self.__client = mqtt.Client("mqtt5_client",protocol=mqtt.MQTTv5)
         self.__metrics_count = 0
         self.__response_chunks = []
+        self.__response_dic = {}
+        self.__code = -1
 
     def __on_message(self, client, userdata, message):
         self.__response_dic = json.loads(message.payload)
@@ -36,7 +40,8 @@ class DabClient:
         metrics_response = json.loads(message.payload)
         if self.__metrics_count < METRICS_TIMES:
             self.__metrics_count += 1
-            print(metrics_response)
+            logger = getattr(self, "logger", LOGGER)
+            logger.info(f"{metrics_response}")
         else:
             self.__metrics_state = True
             self.__lock.release()
@@ -45,22 +50,38 @@ class DabClient:
         self.__client.disconnect()
 
     def connect(self,broker_address,broker_port):
-        self.__client.connect(broker_address, port=broker_port)
-        self.__client.loop_start()
+        try:
+            self.__client.connect(broker_address, port=broker_port)
+            self.__client.loop_start()
+        except Exception as e:
+            handle_connection_error(broker_address, broker_port, e)
     
     def request(self,device_id,operation,msg="{}"):
         # Send request and block until get the response or timeout
         topic = "dab/" + device_id+"/" + operation
-        response_topic="dab/_response/"+topic
+        response_topic = f"dab/_response/{uuid.uuid4().hex}"
+        self.__response_chunks.clear()
+        self.__response_dic = {}
+        self.__code = -1
+
+        if not self.__lock.locked():
+            self.__lock.acquire()
+
+        def _on_response(client, userdata, message):
+            self.__on_message(client, userdata, message)
+
+        self.__client.message_callback_add(response_topic, _on_response)
         self.__client.subscribe(response_topic)
         properties=Properties(PacketTypes.PUBLISH)
         properties.ResponseTopic=response_topic
-        self.__client.on_message = self.__on_message
-        self.__client.subscribe(response_topic)
         self.__client.publish(topic,msg,properties=properties)
-        self.__response_chunks.clear()
         if not (self.__lock.acquire(timeout = 90)):
             self.__code = 100
+        try:
+            self.__client.message_callback_remove(response_topic)
+        except:
+            pass
+        self.__client.unsubscribe(response_topic)
         
     def response(self):
         if((self.__code != -1) and (self.__code != 100)):
@@ -88,16 +109,17 @@ class DabClient:
         return self.__code
     
     def last_error_msg(self):
-        if(self.__code == -1):
-            print("Unknown error",end='')
-        elif(self.__code == 100):
-            print("Timeout",end='')
-        elif(self.__code == 400):
-            print("Request invalid or malformed",end='')
-        elif(self.__code == 500):
-            print("Internal error",end='')
-        elif(self.__code == 501):
-            print("Not implemented",end='')
+        logger = getattr(self, "logger", LOGGER)
+        if (self.__code == -1):
+            logger.warn("Unknown error")
+        elif (self.__code == 100):
+            logger.warn("Timeout")
+        elif (self.__code == 400):
+            logger.warn("Request invalid or malformed")
+        elif (self.__code == 500):
+            logger.error("Internal error")
+        elif (self.__code == 501):
+            logger.warn("Not implemented")
 
     # ---- Minimal discovery compatible with callers passing attempts + wait_seconds ----
     def discover_devices(self, attempts: int = 1, wait_seconds: float = 1.0):

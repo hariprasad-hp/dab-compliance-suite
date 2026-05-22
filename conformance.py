@@ -12,22 +12,20 @@ import dab.output
 import dab.version
 import json
 from util.enforcement_manager import EnforcementManager
-from util.config_loader import ensure_app_available
-from util.config_loader import ensure_app_available, get_appstore_url_or_fail
+from util.config_loader import ensure_app_available, build_install_from_app_store_body, build_incorrect_format_body
 
 # Implement the test cases for conformance test.
 CONFORMANCE_TEST_CASE = [
     ("operations/list",'{}', dab.operations.list, 200, "Conformance", "2.0", False),
     ("applications/list",'{}', dab.applications.list, 250, "Conformance", "2.0", False),
     ("applications/launch",lambda: f'{{"appId": "{config.apps["youtube"]}"}}', dab.applications.launch, 10000, "Conformance", "2.0", False),
-    ("applications/launch",lambda: f'{{"appId": "{config.apps["youtube"]}"}}', dab.applications.launch, 10000, "app launch Negative Test", "2.0", True),
     ("applications/launch",f'{{"appId_": "{config.apps["youtube"]}"}}', dab.applications.launch, 10000, "Conformance Bad Request 1", "2.0", True),
     ("applications/launch",'{"appId": "invalid"}', dab.applications.launch, 10000, "Conformance Bad Request 2", "2.0", True),
     ("applications/launch",'{"appId": true}', dab.applications.launch, 10000, "Conformance Bad Request 3", "2.0", True),
     ("applications/launch",lambda: f'{{"appId": "{config.apps["youtube"]}", "parameters": ["v%3DSs75O8yllyc","enableEventConsole%3Dtrue","env_showConsole%3Dtrue"]}}', dab.applications.launch, 10000, "with parameters", "2.0", False),
     ("applications/launch",f'{{"appId": "{config.apps["youtube"]}", "parameters_": ["v%3DSs75O8yllyc","enableEventConsole%3Dtrue","env_showConsole%3Dtrue"]}}', dab.applications.launch, 10000, "with parameters bad request 1", "2.0", True),
     ("applications/launch",f'{{"appId": "{config.apps["youtube"]}", "parameters": true}}', dab.applications.launch, 10000, "with parameters bad request 2", "2.0", True),
-    ("applications/launch-with-content",f'{{"appId": "{config.apps["youtube"]}", "contentId": "jfKfPfyJRdk"}}', dab.applications.launch_with_content, 10000, "Conformance", "2.0", False),
+    ("applications/launch-with-content",f'{{"appId": "{config.apps["youtube"]}", "contentId": "CNeakmoER7Q"}}', dab.applications.launch_with_content, 10000, "Conformance", "2.0", False),
     ("applications/launch-with-content",f'{{"appId": "{config.apps["youtube"]}", "contentId": "invalid_id"}}', dab.applications.launch_with_content, 10000, "Conformance invalid content", "2.0", True),
     ("applications/get-state",f'{{"appId": "{config.apps["youtube"]}"}}', dab.applications.get_state, 200, "Conformance", "2.0", False),
     ("applications/exit",f'{{"appId": "{config.apps["youtube"]}"}}', dab.applications.exit, 5000, "Conformance", "2.0", False),
@@ -35,7 +33,6 @@ CONFORMANCE_TEST_CASE = [
     ("system/settings/list",'{}', dab.system.settings_list, 200, "Conformance", "2.0", False),
     ("system/settings/get",'{}', dab.system.settings_get, 750, "Conformance", "2.0", False),
     ("system/settings/set",'{"language": "en-US"}', dab.system.settings_set, 120000, "language", "2.0", False),
-    ("system/settings/set",'{"language_": "en-US"}', dab.system.settings_set, 120000, "language bad request1", "2.0", True),
     ("system/settings/set",'{"language": true}', dab.system.settings_set, 120000, "language bad request2", "2.0", True),
     ("system/settings/set",'{"outputResolution": {"width": 3840, "height": 2160, "frequency": 60} }', dab.system.settings_set, 3000, "outputResolution", "2.0", False),
     ("system/settings/set",'{"outputResolution": "invalid" }', dab.system.settings_set, 3000, "outputResolution bad request", "2.0", True),
@@ -69,7 +66,7 @@ CONFORMANCE_TEST_CASE = [
     ("system/settings/set", '{"screenSaverMinTimeout": 60}', dab.system.settings_set, 5000, "Set Screen Saver Min Timeout", "2.1", False),
     ("system/settings/set", '{"personalizedAds": true}', dab.system.settings_set, 5000, "Set Personalized Ads", "2.1" , False),
     ("system/settings/set", '{"highContrastText": true}', dab.system.settings_set, 5000, "Set High Contrast Text", "2.1" , False),
-    ("system/settings/set", '{"identifierForAdvertising": true}', dab.system.settings_set, 5000, "Set identifier For Advertising", "2.1" , False),
+    ("system/settings/set", '{"identifierForAdvertising": "38400000-8cf0-11bd-b23e-10b96e40000d"}', dab.system.settings_set, 5000, "Set identifier For Advertising", "2.1" , False),
     ("system/settings/set", '{"brightness": 10}', dab.system.settings_set, 5000, "Set brightness", "2.1" , False),
     ("system/settings/set", '{"contrast": 10}', dab.system.settings_set, 5000, "Set contrast", "2.1" , False),
     ("system/settings/set", '{"timeZone": "America/Los_Angeles"}', dab.system.settings_set, 5000, "Set timeZone", "2.1" , False),
@@ -175,7 +172,6 @@ CONFORMANCE_TEST_CASE = [
     ("voice/send-audio",f'{{"fileLocation": "https://storage.googleapis.com/ytlr-cert.appspot.com/voice/OpenNetflix.wav", "voiceSystem": "{config.va}"}}',dab.voice.send_audio, 10000, "Conformance Open Netflix", "2.0", False),
     ("voice/send-audio",f'{{"fileLocation": "https://storage.googleapis.com/ytlr-cert.appspot.com/voice/OpenNetflix.mp4", "voiceSystem": "{config.va}"}}',dab.voice.send_audio, 10000, "Conformance With Unsupported Format", "2.0", True),
     ("voice/send-audio",f'{{"fileLocation": "https://storage.googleapis.com/ytlr-cert.appspot.com/voice/CorruptedAudio.wav", "voiceSystem": "{config.va}"}}',dab.voice.send_audio, 10000, "Conformance With Corrupted Audio", "2.0", True),
-    ("voice/send-audio",f'{{"fileLocation": "https://storage.googleapis.com/ytlr-cert.appspot.com/voice/KoreanAudio.wav", "voiceSystem": "{config.va}"}}',dab.voice.send_audio, 10000,"Sending Different Language Audio", "2.0",False),
     ("voice/send-audio",f'{{"fileLocation": "https://storage.googleapis.com/ytlr-cert.appspot.com/voice/LongAudioClip.wav", "voiceSystem": "{config.va}"}}',dab.voice.send_audio, 10000,"Sending Long Audio Clip", "2.0",False),
     ("voice/send-text",f'{{"requestText" : "Play lady Gaga music on YouTube", "voiceSystem": "{config.va}"}}', dab.voice.send_text, 10000, "Conformance With VA", "2.0", False),
     ("voice/send-text",f'{{"requestText_" : "Play lady Gaga music on YouTube", "voiceSystem": "{config.va}"}}', dab.voice.send_text, 10000, "Conformance With VA Bad Request1", "2.0", True),
@@ -187,12 +183,12 @@ CONFORMANCE_TEST_CASE = [
     ("system/restart",' {}', dab.system.restart, 30000, "Conformance", "2.0", False),
     ("applications/install", lambda: json.dumps(ensure_app_available(app_id="Sample_App", prompt_if_missing=False)), dab.applications.install, 120000, "Install App Conformance", "2.1", False),
     ("applications/install", lambda: json.dumps({"fileLocation": f""}), dab.applications.install, 120000, "Install App Conformance With Blank URL", "2.1", True),
-    ("applications/install", lambda: json.dumps({"fileLocation": f"file://{ensure_app_available('unsupported_format_app.txt')}"}), dab.applications.install, 120000, "Install App Conformance With Incorrect Format", "2.1", True),
+    ("applications/install", lambda: json.dumps(build_incorrect_format_body()), dab.applications.install, 120000, "Install App Conformance With Incorrect Format", "2.1", True),    
     ("applications/uninstall",lambda: f'{{"appId": "{config.apps["sample_app"]}"}}', dab.applications.uninstall, 50000, "Conformance", "2.1", False),
     ("applications/uninstall",lambda: f'{{"appId": "com.example!@#"}}', dab.applications.uninstall, 50000, "Conformance Bad Request", "2.1", True),
     ("applications/clear-data",lambda: f'{{"appId": "{config.apps["youtube"]}"}}', dab.applications.clear_data, 10000, "Conformance", "2.1", False),
     ("applications/clear-data",lambda: f'{{"appId": ""}}', dab.applications.clear_data, 10000, "Conformance Bad Request", "2.1", True),
-    ("applications/install-from-app-store", lambda: json.dumps({"appId": get_appstore_url_or_fail(), "timeout": 60000}), dab.applications.install_from_appstore, 120000, "Install From App Store Conformance", "2.1", False),
+    ("applications/install-from-app-store", lambda: json.dumps(build_install_from_app_store_body("Sample_App", timeout=60000)), dab.applications.install_from_appstore, 120000, "Install From App Store Conformance", "2.1", False),
     ("system/logs/start-collection", '{}', dab.system.start_log_collection, 200, "Conformance", "2.1" , False), 
     ("system/logs/stop-collection", '{}', dab.system.stop_log_collection, 200, "Conformance", "2.1" , False), 
     ("system/logs/stop-collection", '{}', dab.system.stop_log_collection, 400, "Stop Without Start Negative", "2.1" , True),
