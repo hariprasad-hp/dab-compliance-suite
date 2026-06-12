@@ -2,3 +2,8 @@ __pycache__/
 .DS_Store
 screenshot.html
 test_result/output_image.json
+test_version.txt
+build/
+dist/
+*.spec
+dab-compliance-suite-*.zip

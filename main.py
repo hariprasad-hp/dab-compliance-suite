@@ -19,9 +19,14 @@ import dab.output
 import dab.version
 import argparse
 from logger import LOGGER
+from dab_tester import get_test_tool_version
 from util.config_loader import init_interactive_setup, make_app_id_list
 from util.runtime_config_store import load_config, apply_overrides, save_config
 from util.argument_validator import validate_arguments_and_warn
+from util.binary_update import update_from_manifest, update_from_source
+
+if getattr(sys, "frozen", False):
+    os.chdir(os.path.dirname(sys.executable))
 
 config_path = os.environ.get("DAB_CONFIG_JSON")
 
@@ -73,6 +78,21 @@ if __name__ == "__main__":
     parser.add_argument("--init", action="store_true",
                         help="Interactive setup: prompt for app paths (and optional store URL), then exit.")
 
+    parser.add_argument("--tool-version", action="store_true",
+                        help="Print the packaged test tool version and exit.")
+
+    parser.add_argument("--update-binary", type=str, default=None,
+                        help="Update this binary from a local zip/file or direct URL, then exit.")
+
+    parser.add_argument("--update-version", type=str, default=None,
+                        help="Update to a version from the update manifest. Use 'latest' or a specific test version.")
+
+    # `--update-manifest` CLI option removed per request.
+    # Author: Hariprasad Hiredonkihalli Paramesh <hariprasadh@google.com>
+
+    parser.add_argument("--update-dir", type=str, default=None,
+                        help="Directory to update. Defaults to the running binary directory.")
+
     parser.add_argument("--config-app", action="append", default=None,
                         help="Update runtime apps mapping and exit. Repeat: --config-app key=value")
     
@@ -85,10 +105,35 @@ if __name__ == "__main__":
     parser.set_defaults(output="")
     parser.set_defaults(case=99999)
     args = parser.parse_args()
-    validate_arguments_and_warn(args)
     LOGGER.verbose = bool(args.verbose)
     device_id = args.ID
 
+    if args.tool_version:
+        LOGGER.result(get_test_tool_version())
+        raise SystemExit(0)
+
+    if args.update_binary:
+        try:
+            path = update_from_source(args.update_binary, install_dir=args.update_dir)
+            LOGGER.result(f"[UPDATE] Installed update into {path}")
+            raise SystemExit(0)
+        except Exception as e:
+            LOGGER.error(f"[UPDATE] Failed: {type(e).__name__}: {e}")
+            raise SystemExit(2)
+
+    if args.update_version:
+        try:
+            version, path = update_from_manifest(
+                version=args.update_version,
+                install_dir=args.update_dir,
+            )
+            LOGGER.result(f"[UPDATE] Installed version {version} into {path}")
+            raise SystemExit(0)
+        except Exception as e:
+            LOGGER.error(f"[UPDATE] Failed: {type(e).__name__}: {e}")
+            raise SystemExit(2)
+
+    validate_arguments_and_warn(args)
 
     if getattr(args, "config_show", False):
         path, cfg, created = load_config(config_path)
