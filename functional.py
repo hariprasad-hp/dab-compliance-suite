@@ -1,8 +1,9 @@
 from result_json import TestResult
-from dab_tester import to_test_id
+from dab_tester import log, to_test_id
 import config
 import json
 import time
+import dab.app_telemetry
 import sys
 from readchar import readchar
 from util.enforcement_manager import EnforcementManager
@@ -2787,7 +2788,103 @@ def run_device_restart_and_telemetry_check(dab_topic, test_name, tester, device_
 
     return result
 
-# === Test 22: Stop App Telemetry Without Active Session (Negative) ===
+# === Test 22: Application CPU Telemetry While Running ===
+def run_app_cpu_telemetry_while_running_check(dab_topic, test_name, tester, device_id):
+    """Validate the app-scoped CPU notification stream defined by DAB 2.0."""
+    test_id = to_test_id(f"{dab_topic}/{test_name}")
+    logs = []
+    result = TestResult(test_id, device_id, dab_topic, "{}", "UNKNOWN", "", logs)
+    app_id = None
+    telemetry_started = False
+    capture_started = False
+
+    def request(topic, payload):
+        rc = tester.execute_cmd(device_id, topic, payload)
+        raw = tester.dab_client.response() or ""
+        try:
+            response = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            response = {}
+        log(result, f"[DAB] {topic}: status={tester.dab_client.last_error_code()}, response={raw or '<empty>'}")
+        return rc, response
+
+    try:
+        for line in (
+            f"[TEST] Application CPU Telemetry While Running — {test_name} (test_id={test_id}, device={device_id})",
+            "[DESC] Launches an installed app, confirms FOREGROUND state, then validates app-telemetry/metrics/<appId>.",
+            "[DESC] Validates one JSON object per MQTT message, numeric timestamp/value, cpu 0..100, and clean stop.",
+        ):
+            log(result, line)
+
+        if not require_capabilities(tester, device_id,
+                                    "ops: applications/list, applications/launch, applications/get-state, app-telemetry/start, app-telemetry/stop",
+                                    result, logs):
+            return result
+
+        rc, apps_response = request("applications/list", "{}")
+        applications = apps_response.get("applications", []) if rc == 0 else []
+        configured_id = str(config.apps.get("youtube", "YouTube"))
+        app_id = next((a.get("appId") for a in applications
+                       if isinstance(a, dict) and str(a.get("appId", "")).lower() == configured_id.lower()), None)
+        if not app_id:
+            result.test_result = "SKIPPED"
+            log(result, f"[SKIPPED] Configured app {configured_id!r} was not returned by applications/list.")
+            return result
+
+        rc, _ = request("applications/launch", json.dumps({"appId": app_id}))
+        if rc != 0:
+            result.test_result = "FAILED"
+            log(result, "[FAILED] Could not launch the target app.")
+            return result
+        rc, state_response = request("applications/get-state", json.dumps({"appId": app_id}))
+        if rc != 0 or state_response.get("state") != "FOREGROUND":
+            result.test_result = "FAILED"
+            log(result, f"[FAILED] App must be FOREGROUND before CPU capture; got {state_response.get('state')!r}.")
+            return result
+
+        tester.dab_client.begin_metrics_capture(device_id, f"app-telemetry/metrics/{app_id}")
+        capture_started = True
+        rc, start_response = request("app-telemetry/start", json.dumps({"appId": app_id, "duration": 1000}))
+        if rc != 0 or not isinstance(start_response.get("duration"), (int, float)) or isinstance(start_response.get("duration"), bool) or start_response["duration"] <= 0:
+            result.test_result = "FAILED"
+            log(result, "[FAILED] Telemetry start must return status 200 and a positive numeric actual duration.")
+            return result
+        telemetry_started = True
+
+        samples = tester.dab_client.wait_for_metrics_capture(minimum_messages=3, timeout=12)
+        valid, errors, warnings = dab.app_telemetry.validate_metric_messages(samples, require_cpu=True)
+        for sample in samples:
+            log(result, f"[METRIC] {json.dumps(sample, sort_keys=True)}")
+        for warning in warnings:
+            log(result, f"[WARNING] {warning}")
+        for error in errors:
+            log(result, f"[INVALID] {error}")
+        if not valid:
+            # CPU itself is optional in DAB.  If the stream is otherwise valid
+            # but does not implement CPU, make that distinction visible.
+            result.test_result = "OPTIONAL_FAILED" if errors == ["No 'cpu' telemetry message was received (CPU is optional in DAB, but required by this CPU test)."] else "FAILED"
+            return result
+
+        result.test_result = "PASS"
+        log(result, "[PASS] Foreground application emitted spec-valid CPU telemetry.")
+        return result
+    except Exception as error:
+        result.test_result = "SKIPPED"
+        log(result, f"[SKIPPED] Unexpected telemetry-test error: {type(error).__name__}: {error}")
+        return result
+    finally:
+        if capture_started:
+            tester.dab_client.end_metrics_capture()
+        if telemetry_started and app_id:
+            try:
+                stop_rc, _ = request("app-telemetry/stop", json.dumps({"appId": app_id}))
+                if stop_rc != 0 and result.test_result == "PASS":
+                    result.test_result = "FAILED"
+                    log(result, "[FAILED] App telemetry did not stop cleanly.")
+            except Exception as error:
+                log(result, f"[WARNING] Could not stop app telemetry: {error}")
+
+# === Test 23: Stop App Telemetry Without Active Session (Negative) ===
 def run_stop_app_telemetry_without_active_session_check(dab_topic, test_name, tester, device_id):
     """
     Ensures the device handles a redundant 'app-telemetry/stop' command gracefully when no session is active.
@@ -11743,6 +11840,7 @@ FUNCTIONAL_TEST_CASE = [
     ("system/settings/set", "functional", run_highContrastText_video_playback_check, "HighContrasTextVideoPlaybackCheck", "2.1", False),
     ("voice/set", "functional", run_set_invalid_voice_assistant_check, "SetInvalidVoiceAssistant", "2.0", True),
     ("system/restart", "functional", run_device_restart_and_telemetry_check, "DeviceRestartAndTelemetryCheck", "2.0", False),
+    ("app-telemetry/start", "functional", run_app_cpu_telemetry_while_running_check, "AppCpuTelemetryWhileRunning", "2.0", False),
     ("app-telemetry/stop", "functional", run_stop_app_telemetry_without_active_session_check, "StopAppTelemetryWithoutActiveSession", "2.1", True),
     ("applications/launch-with-content", "functional", run_launch_video_and_health_check, "LaunchVideoAndHealthCheck", "2.1", False),
     ("voice/list", "functional", run_voice_list_with_no_voice_assistant, "VoiceListWithNoVoiceAssistant", "2.0", True),

@@ -1,5 +1,5 @@
 from time import sleep
-from threading import Lock
+from threading import Event, Lock
 from paho.mqtt.properties import Properties
 from paho.mqtt.packettypes import PacketTypes 
 import paho.mqtt.client as mqtt
@@ -19,6 +19,10 @@ class DabClient:
         self.__response_chunks = []
         self.__response_dic = {}
         self.__code = -1
+        self.__metrics_capture_lock = Lock()
+        self.__metrics_capture_event = Event()
+        self.__metrics_samples = []
+        self.__metrics_capture_topic = None
 
     def __on_message(self, client, userdata, message):
         self.__response_dic = json.loads(message.payload)
@@ -101,6 +105,64 @@ class DabClient:
     def unsubscribe_metrics(self, device_id, operation):
         response_topic = "dab/" + device_id+"/" + operation
         self.__client.unsubscribe(response_topic)
+
+    # These methods are deliberately separate from subscribe_metrics().  The
+    # older method only answers "did any messages arrive?"; telemetry
+    # conformance needs the actual MQTT payloads so their schema and values can
+    # be checked.
+    def begin_metrics_capture(self, device_id, operation):
+        """Subscribe to one telemetry notification topic before issuing start.
+
+        Returns the full MQTT topic.  Call wait_for_metrics_capture() after the
+        start response, then end_metrics_capture() in a finally block.
+        """
+        topic = "dab/" + device_id + "/" + operation
+        with self.__metrics_capture_lock:
+            self.__metrics_samples = []
+            self.__metrics_capture_event.clear()
+            self.__metrics_capture_topic = topic
+
+        def _on_metrics(_client, _userdata, message):
+            try:
+                payload = json.loads(message.payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Keep malformed payloads as evidence for the validator.
+                payload = {"_invalidTelemetryPayload": message.payload.decode("utf-8", errors="replace")}
+            with self.__metrics_capture_lock:
+                self.__metrics_samples.append(payload)
+                self.__metrics_capture_event.set()
+
+        self.__client.message_callback_add(topic, _on_metrics)
+        self.__client.subscribe(topic)
+        return topic
+
+    def wait_for_metrics_capture(self, minimum_messages=1, timeout=10):
+        """Return up to the captured messages after waiting for the requested count."""
+        deadline = __import__("time").monotonic() + timeout
+        while True:
+            with self.__metrics_capture_lock:
+                samples = list(self.__metrics_samples)
+            if len(samples) >= minimum_messages:
+                return samples
+            remaining = deadline - __import__("time").monotonic()
+            if remaining <= 0:
+                return samples
+            self.__metrics_capture_event.wait(remaining)
+            self.__metrics_capture_event.clear()
+
+    def end_metrics_capture(self):
+        """Remove the temporary telemetry callback and return all collected payloads."""
+        with self.__metrics_capture_lock:
+            topic = self.__metrics_capture_topic
+            samples = list(self.__metrics_samples)
+            self.__metrics_capture_topic = None
+        if topic:
+            try:
+                self.__client.message_callback_remove(topic)
+            except Exception:
+                pass
+            self.__client.unsubscribe(topic)
+        return samples
     
     def last_metrics_state(self):
         return self.__metrics_state
