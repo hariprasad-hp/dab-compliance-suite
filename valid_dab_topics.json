@@ -35,5 +35,6 @@
   "system/logs/stop-collection",
   "system/power-mode/get",
   "system/power-mode/set",
-  "system/setup/skip"
+  "system/factory-reset",
+  "system/network-reset"
 ]
