@@ -258,7 +258,7 @@ def start_runtime_install_bridge(
     expected_app_id: Optional[str] = None,
     upload_event: Optional[threading.Event] = None,
 ) -> RuntimeApiServerHandle:
-    """Start the shared runtime install bridge if it is not already running."""
+    """Start the shared runtime install bridge, retrying ports if contested across parallel runs."""
     global _ACTIVE_HANDLE
 
     try:
@@ -270,27 +270,46 @@ def start_runtime_install_bridge(
         if _ACTIVE_HANDLE is not None:
             return _ACTIVE_HANDLE
 
-        port = _pick_available_port(host=host, preferred_port=preferred_port)
-        if port != int(preferred_port):
-            LOGGER.warn(
-                f"[RUNTIME INSTALL] Port {preferred_port} is busy. Falling forward to available port {port}."
-            )
+        import time
 
         app = create_runtime_install_app(
             config_dir=config_dir,
             expected_app_id=expected_app_id,
             upload_event=upload_event,
         )
-        server = uvicorn.Server(
-            uvicorn.Config(
-                app,
-                host=host,
-                port=port,
-                log_level="warning",
+        port = None
+        server = None
+        thread = None
+        next_candidate = int(preferred_port)
+        for _ in range(5):
+            candidate = _pick_available_port(host=host, preferred_port=next_candidate, attempts=50)
+            srv = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=host,
+                    port=candidate,
+                    log_level="warning",
+                )
             )
-        )
-        thread = threading.Thread(target=server.run, name="dab-runtime-install-bridge", daemon=True)
-        thread.start()
+            th = threading.Thread(target=srv.run, name="dab-runtime-install-bridge", daemon=True)
+            th.start()
+            deadline = time.time() + 2.0
+            while time.time() < deadline and th.is_alive() and not getattr(srv, "started", False):
+                time.sleep(0.02)
+            if getattr(srv, "started", False) and th.is_alive():
+                port, server, thread = candidate, srv, th
+                break
+            srv.should_exit = True
+            th.join(timeout=0.5)
+            next_candidate = candidate + 1
+
+        if port is None:
+            raise RuntimeError("Failed to start uvicorn runtime install bridge on an available port.")
+
+        if port != int(preferred_port):
+            LOGGER.warn(
+                f"[RUNTIME INSTALL] Port {preferred_port} is busy. Falling forward to available port {port}."
+            )
         public_host = _resolve_public_host(host)
         if public_host == "127.0.0.1" and host in {"0.0.0.0", "::"}:
             LOGGER.warn(
