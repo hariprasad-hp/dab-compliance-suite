@@ -102,6 +102,17 @@ class DabChecker:
         if not settings_map:
             return None, "No settings map (empty or malformed settings/list cache)."
 
+        if key == "screenSaverTimeout":
+            if settings_map.get("screenSaver") is not True:
+                return None, "'screenSaverTimeout' unsupported ('screenSaver' missing or false in settings/list)."
+            min_to = settings_map.get("screenSaverMinTimeout", 0)
+            if isinstance(min_to, bool) or not isinstance(min_to, (int, float)):
+                min_to = 0
+            if not isinstance(preferred, bool) and isinstance(preferred, (int, float)) and preferred >= max(min_to, 1):
+                return preferred, f"'screenSaverTimeout' >= min ({min_to}); using preferred={preferred}."
+            chosen = max(int(min_to), 300)
+            return chosen, f"'screenSaverTimeout' supported; using {chosen} (min={min_to})."
+
         if key not in settings_map:
             sample = list(settings_map.keys())[:3]
             return None, f"'{key}' not advertised in settings/list. Known keys (sample): {sample}"
@@ -112,6 +123,10 @@ class DabChecker:
         if isinstance(desc, bool):
             if desc is False:
                 return None, f"'{key}' unsupported (capability=false in settings/list)."
+            if key == "identifierForAdvertising":
+                if isinstance(preferred, str) and preferred.strip():
+                    return preferred, f"'{key}' supported; using preferred='{preferred}'."
+                return "38400000-8cf0-11bd-b23e-10b96e40000d", f"'{key}' supported; using default UUID."
             if isinstance(preferred, bool):
                 return preferred, f"'{key}' supported; using preferred={preferred}."
             return True, f"'{key}' supported; defaulting to True."
@@ -119,7 +134,9 @@ class DabChecker:
         # Numeric range {"min": x, "max": y}
         if isinstance(desc, dict) and {"min", "max"}.issubset(desc.keys()):
             mn, mx = desc["min"], desc["max"]
-            if isinstance(preferred, (int, float)) and mn <= preferred <= mx:
+            if mn >= mx:
+                return None, f"'{key}' unsupported (range min={mn} >= max={mx} in settings/list)."
+            if not isinstance(preferred, bool) and isinstance(preferred, (int, float)) and mn <= preferred <= mx:
                 return preferred, f"'{key}' in range [{mn}, {mx}]; using preferred."
             mid = (mn + mx) // 2 if isinstance(mn, int) and isinstance(mx, int) else (float(mn) + float(mx)) / 2.0
             return mid, f"'{key}' in range [{mn}, {mx}]; using midpoint={mid}."
@@ -280,12 +297,30 @@ class DabChecker:
 
             # Capability/descriptor from settings/list
             sup_map = self.__to_settings_map(EnforcementManager().get_supported_settings())
+
+            if k == "screenSaverTimeout":
+                if sup_map.get("screenSaver") is not True:
+                    return dab_body
+                min_to = sup_map.get("screenSaverMinTimeout", 0)
+                if isinstance(min_to, bool) or not isinstance(min_to, (int, float)):
+                    min_to = 0
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0 or v < min_to:
+                    self.logger.info("[SET precheck] Invalid/out-of-range screenSaverTimeout; sending payload as-is.")
+                    return dab_body
+                return dab_body
+
             desc = sup_map.get(k)
 
-            # NEW: boolean descriptor + non-boolean value → treat as negative
-            if isinstance(desc, bool) and not isinstance(v, bool):
-                self.logger.info("[SET precheck] Boolean descriptor but non-boolean value provided; treating as negative test and sending payload as-is.")
-                return dab_body
+            # Boolean descriptor: check string for identifierForAdvertising, bool for others
+            if isinstance(desc, bool):
+                if k == "identifierForAdvertising":
+                    if not isinstance(v, str) or not v.strip():
+                        self.logger.info("[SET precheck] identifierForAdvertising expects non-empty string; treating as negative.")
+                        return dab_body
+                    return dab_body
+                if not isinstance(v, bool):
+                    self.logger.info("[SET precheck] Boolean descriptor but non-boolean value provided; treating as negative test and sending payload as-is.")
+                    return dab_body
 
             # If no descriptor, don't attempt to auto-fix (could be a neg test on unknown key)
             if desc is None:
@@ -294,10 +329,10 @@ class DabChecker:
 
             # If numeric range and value is out-of-range or non-numeric, treat as negative → as-is
             if isinstance(desc, dict) and {"min", "max"}.issubset(desc.keys()):
-                if not isinstance(v, (int, float)):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
                     self.logger.info("[SET precheck] Non-numeric value for numeric range; treating as negative.")
                     return dab_body
-                if not (desc["min"] <= v <= desc["max"]):
+                if desc["min"] >= desc["max"] or not (desc["min"] <= v <= desc["max"]):
                     self.logger.info("[SET precheck] Out-of-range numeric; treating as negative.")
                     return dab_body
 
@@ -354,7 +389,7 @@ class DabChecker:
             dab_precheck_body = "{}"
             self.logger.info("Fetching the list of supported DAB operations from the device.")
             dab_response = self.__execute_cmd(device_id, dab_precheck_topic, dab_precheck_body)
-            operations = dab_response['operations'] if dab_response is not None else None
+            operations = dab_response.get('operations') if isinstance(dab_response, dict) else None
             EnforcementManager().add_supported_operations(operations)
 
         if not EnforcementManager().get_supported_operations():
@@ -465,6 +500,21 @@ class DabChecker:
             for meta in ("status", "statusText", "ts"):
                 settings_map.pop(meta, None)
 
+            # ---- screenSaverTimeout derives capability from screenSaver + screenSaverMinTimeout ----
+            if request_key == "screenSaverTimeout":
+                if settings_map.get("screenSaver") is not True:
+                    return ValidateCode.UNSUPPORT, "\n'screenSaverTimeout' is NOT supported ('screenSaver' is missing or false in settings/list).\n"
+                min_to = settings_map.get("screenSaverMinTimeout", 0)
+                if isinstance(min_to, bool) or not isinstance(min_to, (int, float)):
+                    min_to = 0
+                if isinstance(request_value, bool) or not isinstance(request_value, (int, float)) or request_value <= 0 or request_value < min_to:
+                    return ValidateCode.UNCERTAIN, (
+                        f"\n'screenSaverTimeout': min timeout is {min_to}; provided '{request_value}' is invalid/out of range. Marking as UNCERTAIN.\n"
+                    )
+                return ValidateCode.SUPPORT, (
+                    f"\n'screenSaverTimeout' supported (screenSaver=true, minTimeout={min_to}). Provided {request_value}.\n"
+                )
+
             # ---- MANDATORY KEY VALIDATION ----
             if request_key not in settings_map:
                 sample = list(settings_map.keys())[:3]
@@ -487,7 +537,11 @@ class DabChecker:
             if isinstance(desc, dict) and {"min", "max"}.issubset(desc.keys()):
                 accepted = f"[{desc['min']}, {desc['max']}]"
                 self.logger.info(f"Accepted domain for '{request_key}': numeric range {accepted}. Provided: {request_value}")
-                if not isinstance(request_value, (int, float)):
+                if desc["min"] >= desc["max"]:
+                    return ValidateCode.UNSUPPORT, (
+                        f"\n'{request_key}' is NOT supported on this device (settings/list range {accepted} has min >= max).\n"
+                    )
+                if isinstance(request_value, bool) or not isinstance(request_value, (int, float)):
                     return ValidateCode.UNCERTAIN, (
                         f"\n'{request_key}': accepted numeric range {accepted}; provided value '{request_value}' is not numeric. Marking as UNCERTAIN.\n"
                     )
@@ -804,6 +858,7 @@ class DabChecker:
         return validate_result, checker_log
 
     def __check_system_settings_set(self, device_id, dab_request_body):
+        """Verify system/settings/get reflects the exact setting value written by system/settings/set."""
         dab_check_topic = "system/settings/get"
         dab_check_body = "{}"
 
@@ -812,22 +867,7 @@ class DabChecker:
         request_body = json.loads(effective_raw)
         (request_key, request_value), = request_body.items()
 
-        # If numeric-range and out-of-range was requested, expect device to clamp to nearest boundary.
         expected_value = request_value
-        try:
-            sup_map = self.__to_settings_map(EnforcementManager().get_supported_settings())
-            desc = sup_map.get(request_key)
-            if isinstance(desc, dict) and {"min", "max"}.issubset(desc.keys()) and isinstance(request_value, (int, float)):
-                mn, mx = desc["min"], desc["max"]
-                if request_value < mn:
-                    expected_value = mn
-                    self.logger.info(f"[check] '{request_key}' requested {request_value} below min {mn} → expecting clamp to {mn}.")
-                elif request_value > mx:
-                    expected_value = mx
-                    self.logger.info(f"[check] '{request_key}' requested {request_value} above max {mx} → expecting clamp to {mx}.")
-        except Exception as e:
-            self.logger.warn(f"[check] clamp expectation compute error for '{request_key}': {e}")
-
         validate_result = False
         actual_value = 'UNKNOWN'
 
@@ -918,8 +958,7 @@ class DabChecker:
         try:
             validate_state = EnforcementManager().verify_logs_chunk(self.dab_tester, logs)
             if validate_state == False:
-                "\n".join(logs)
-                return validate_state, logs
+                return validate_state, "\n".join(logs)
             return EnforcementManager().verify_logs_structure(logs), "\n".join(logs)
         finally:
             EnforcementManager().delete_logs_collection_files()
