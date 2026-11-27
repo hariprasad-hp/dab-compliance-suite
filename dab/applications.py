@@ -14,10 +14,11 @@ def launch(test_result, durationInMs=0,expectedLatencyMs=0):
     if response['status'] != 200:
         return False
     sleep(5)
-    return YesNoQuestion(test_result, "App started?") and Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    q_ok = YesNoQuestion(test_result, "App started?")
+    lat_ok = Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    return q_ok and lat_ok
 
 def launch_with_content(test_result, durationInMs=0,expectedLatencyMs=0):
-    dab_response_validator.validate_dab_response_schema(test_result.response)
     try:
         dab_response_validator.validate_dab_response_schema(test_result.response)
     except Exception as error:
@@ -27,7 +28,9 @@ def launch_with_content(test_result, durationInMs=0,expectedLatencyMs=0):
     if response['status'] != 200:
         return False
     sleep(5)
-    return YesNoQuestion(test_result, "App started with playback?") and Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    q_ok = YesNoQuestion(test_result, "App started with playback?")
+    lat_ok = Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    return q_ok and lat_ok
     
 def exit(test_result, durationInMs=0,expectedLatencyMs=0):
     try:
@@ -39,16 +42,30 @@ def exit(test_result, durationInMs=0,expectedLatencyMs=0):
     if response['status'] != 200:
         return False
     sleep(5)
-    return YesNoQuestion(test_result, "App exited?") and Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    q_ok = YesNoQuestion(test_result, "App exited?")
+    lat_ok = Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    return q_ok and lat_ok
 
 def list(test_result, durationInMs=0,expectedLatencyMs=0):
+    """Validate applications/list schema, forbid whitespace in appId/version, and cache appIds."""
+    response = jsons.loads(test_result.response)
+    if response.get('status') != 200:
+        return False
+    for application in response.get('applications') or []:
+        app_id = application.get('appId') if isinstance(application, dict) else None
+        if not isinstance(app_id, str) or not app_id or any(ch.isspace() for ch in app_id):
+            msg = f"[FAILED] Invalid appId in applications/list (spaces not supported): {app_id!r}"
+            print(msg)
+            if getattr(test_result, "logs", None) is not None:
+                test_result.logs.append(msg)
+            return False
     try:
         dab_response_validator.validate_list_applications_response_schema(test_result.response)
     except Exception as error:
-        print("Schema error:", error)
-        return False
-    response  = jsons.loads(test_result.response)
-    if response['status'] != 200:
+        msg = f"[FAILED] applications/list schema error: {getattr(error, 'message', error)}"
+        print(msg)
+        if getattr(test_result, "logs", None) is not None:
+            test_result.logs.append(msg)
         return False
     for application in response['applications']:
         EnforcementManager().add_supported_application(application['appId'])

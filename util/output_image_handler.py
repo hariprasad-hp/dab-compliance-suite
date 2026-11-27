@@ -27,7 +27,7 @@ def _from_data_uri(v: str) -> str:
     return v
 
 def _extract_png_bytes(resp: Union[Dict[str, Any], str]) -> bytes:
-    """Extract base64 image bytes from response['outputImage'] or raise."""
+    """Decode base64 image bytes from response['outputImage'] and verify the PNG signature."""
     if isinstance(resp, str):
         resp = json.loads(resp)
     if not isinstance(resp, dict):
@@ -39,9 +39,12 @@ def _extract_png_bytes(resp: Union[Dict[str, Any], str]) -> bytes:
 
     b64 = _normalize_b64(_from_data_uri(raw))
     try:
-        return base64.b64decode(b64, validate=False)
+        png_bytes = base64.b64decode(b64, validate=False)
     except Exception as e:
         raise ValueError(f"base64 decode failed: {e}")
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("decoded outputImage is not a valid PNG binary")
+    return png_bytes
 
 def _dir_of(path_like: Optional[str]) -> Optional[str]:
     if not path_like:

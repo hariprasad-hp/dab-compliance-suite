@@ -4,13 +4,14 @@ from dab_tester import YesNoQuestion, Default_Validations
 import jsons
 
 def get(test_result, durationInMs=0,expectedLatencyMs=0):
+    """Validate health-check/get schema and require both HTTP 200 and healthy=True per DAB §5.7."""
     try:
         dab_response_validator.validate_health_check_response_schema(test_result.response)
     except Exception as error:
         print("Schema error:", error)
         return False
     response  = jsons.loads(test_result.response)
-    if response['status'] != 200:
+    if response['status'] != 200 or response.get('healthy') is not True:
         return False
     sleep(0.1)
     return Default_Validations(test_result, durationInMs, expectedLatencyMs)

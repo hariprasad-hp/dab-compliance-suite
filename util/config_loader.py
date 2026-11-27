@@ -165,7 +165,7 @@ def _remove_app_files(app_id: str, config_dir: str) -> int:
     return removed
 
 
-def _to_install_payload(app_id: str, file_path: Path, timeout: int = 60000) -> Dict[str, object]:
+def _to_install_payload(app_id: str, file_path: Path, timeout: int = 60) -> Dict[str, object]:
     """Build a standard install payload for applications/install (any extension)."""
     ext = file_path.suffix[1:].lower() if file_path.suffix else "bin"
     try:
@@ -175,11 +175,12 @@ def _to_install_payload(app_id: str, file_path: Path, timeout: int = 60000) -> D
     except Exception as e:
         raise RuntimeError(f"Could not create runtime install URL for '{app_id}': {e}") from e
 
+    timeout_sec = int(timeout // 1000) if int(timeout) >= 1000 else int(timeout)
     return {
         "appId": app_id,
         "url": install_url,
         "format": ext or "bin",
-        "timeout": int(timeout),
+        "timeout": max(timeout_sec, 1),
     }
 
 # -------------------------------------------------------------------------
@@ -581,16 +582,13 @@ def get_or_prompt_app_url(
 
 def build_install_from_app_store_body(
     app_id: str = "Sample_App",
-    timeout: int = 60000,
+    timeout: int = 60,
     per_app: bool = True,
     prompt_if_missing: bool = False,
 ) -> Dict[str, object]:
     """
-    Build payload for applications/install-from-app-store:
-      {"appId": "<ID>", "url": "<store URL/deeplink>", "timeout": 60000}
-
-    - Prompts for missing URLs if prompt_if_missing=True (same UX as asking for app path).
-    - Honors the 3 allowed IDs: Sample_App, Sample_App1, Large_App.
+    Build payload for applications/install-from-app-store per DAB 2.1:
+      {"appId": "<ID>", "appStoreId": "<store URL/deeplink>"}
     """
     sid = _enforce_allowed(app_id)
     url = get_or_prompt_app_url(
@@ -600,7 +598,7 @@ def build_install_from_app_store_body(
         path=APP_URLS_JSON,
         store_config_path=DEFAULT_STORE_JSON,
     )
-    return {"appId": sid, "url": url, "timeout": int(timeout)}
+    return {"appId": sid, "appStoreId": url}
 
 # -------------------------------------------------------------------------
 # Payload builder & error (unchanged)
@@ -779,5 +777,5 @@ def build_incorrect_format_body(app_id: str | None = None):
         "appId": resolved_app_id,
         "url": txt_path,
         "format": "txt",
-        "timeout": 60000,
+        "timeout": 10,
     }

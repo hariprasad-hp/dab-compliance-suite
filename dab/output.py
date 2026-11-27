@@ -47,7 +47,9 @@ def image(test_result, durationInMs=0, expectedLatencyMs=0):
 
     # 5) Prompt and run default timing validation
     prompt = f"Verify '{png_path}' exists and shows the screenshot"
-    ok = YesNoQuestion(test_result, prompt) and Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    q_ok = YesNoQuestion(test_result, prompt)
+    lat_ok = Default_Validations(test_result, durationInMs, expectedLatencyMs)
+    ok = q_ok and lat_ok
 
     # 6) Always attempt to delete the saved file (even if validations failed) — console-only logs
     try:
