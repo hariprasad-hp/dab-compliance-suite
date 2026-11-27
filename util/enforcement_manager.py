@@ -36,7 +36,7 @@ class ValidateCode(Enum):
     UNCERTAIN = 2
 
 LOGS_COLLECTION_CATEGORIES = {"system", "application", "crash"}
-LOGS_COLLECTION_FOLDER = "logs"
+LOGS_COLLECTION_FOLDER = f"logs_{os.getpid()}"
 LOGS_COLLECTION_PACKAGE = f"{LOGS_COLLECTION_FOLDER}.tar.gz"
 
 @singleton
@@ -202,6 +202,7 @@ class EnforcementManager:
         return validate_state
 
     def verify_logs_structure(self, logs):
+        """Extract collected log archive and require 'system' and 'application' folders ('crash' optional per DAB 2.1 §5.3)."""
         logs_structure = set()
         try:
             with tarfile.open(LOGS_COLLECTION_PACKAGE, 'r:gz') as tar:
@@ -211,14 +212,21 @@ class EnforcementManager:
             logs.append(f"[FAILED] Verify {LOGS_COLLECTION_PACKAGE} failed: {str(e)}")
             return False
 
-        entries = os.listdir(LOGS_COLLECTION_FOLDER)
+        entries = [e for e in os.listdir(LOGS_COLLECTION_FOLDER) if not e.startswith(".")]
+        scan_root = LOGS_COLLECTION_FOLDER
+        if len(entries) == 1:
+            candidate = os.path.join(LOGS_COLLECTION_FOLDER, entries[0])
+            if os.path.isdir(candidate) and entries[0] not in LOGS_COLLECTION_CATEGORIES:
+                scan_root = candidate
+                entries = [e for e in os.listdir(scan_root) if not e.startswith(".")]
+
         for entry in entries:
-            full_path = os.path.join(LOGS_COLLECTION_FOLDER, entry)
+            full_path = os.path.join(scan_root, entry)
             if os.path.isdir(full_path):
                 logs_structure.add(entry)
 
-        if logs_structure == LOGS_COLLECTION_CATEGORIES:
-            logs.append(f"The logs structure follow DAB requirement, include folder {LOGS_COLLECTION_CATEGORIES}")
+        if {"system", "application"}.issubset(logs_structure) and logs_structure.issubset(LOGS_COLLECTION_CATEGORIES):
+            logs.append(f"The logs structure follow DAB requirement, include folder {logs_structure}")
             validate_state = True
         else:
             validate_state = False

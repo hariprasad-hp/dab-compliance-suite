@@ -76,6 +76,7 @@ def apply_overrides(cfg, apps_kv_list=None, va=None):
 
 
 def load_config(path=None):
+    """Load runtime config from disk, writing back only when missing or repaired to stay parallel-safe."""
     path = path or DEFAULT_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -85,22 +86,27 @@ def load_config(path=None):
         LOGGER.ok(f"[CONFIG] Created default runtime config: {path}")
         return path, cfg, True
 
+    repaired = False
     try:
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
         LOGGER.warn(f"[CONFIG] Failed to read {path}: {e}. Recreating defaults.")
         cfg = _defaults()
+        repaired = True
 
     if not isinstance(cfg, dict):
         cfg = _defaults()
+        repaired = True
     if not isinstance(cfg.get("apps"), dict):
         cfg["apps"] = _defaults()["apps"]
+        repaired = True
     if not cfg.get("va"):
         cfg["va"] = _defaults()["va"]
+        repaired = True
 
-    # Keep file always valid
-    save_config(path, cfg)
+    if repaired:
+        save_config(path, cfg)
     return path, cfg, False
 
 
