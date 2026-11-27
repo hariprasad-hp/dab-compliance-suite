@@ -1,6 +1,54 @@
 from jsonschema import validate
 import jsons
-import dab_tester
+import re
+
+# Non-empty identifier/parameter token with zero whitespace characters allowed.
+NO_SPACE_STR = {"type": "string", "minLength": 1, "pattern": r"^\S+$"}
+NO_SPACE_OPT_EMPTY_STR = {"type": "string", "pattern": r"^\S*$"}
+
+# Fields allowed to contain human-readable display prose (spaces permitted).
+HUMAN_PROSE_FIELDS = frozenset({
+    "error",
+    "message",
+    "statusText",
+    "friendlyName",
+    "version",
+    "manufacturer",
+    "model",
+    "chipset",
+    "firmwareVersion",
+    "firmwareBuild",
+    "uptimeSince",
+    "title",
+    "requestText",
+    "searchText",
+})
+
+
+def find_whitespace_violations(payload, path: str = "") -> list:
+    """
+    Recursively check a DAB JSON object/array so no parameter name or non-prose
+    identifier/enum/code value (including 3P custom fields) contains whitespace.
+    """
+    issues = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            key_str = str(k)
+            cur_path = f"{path}.{key_str}" if path else key_str
+            if any(ch.isspace() for ch in key_str):
+                issues.append(f"parameter name {cur_path!r} contains whitespace")
+            if key_str in HUMAN_PROSE_FIELDS or key_str == "details":
+                continue
+            issues.extend(find_whitespace_violations(v, cur_path))
+    elif isinstance(payload, list):
+        for idx, item in enumerate(payload):
+            issues.extend(find_whitespace_violations(item, f"{path}[{idx}]"))
+    elif isinstance(payload, str):
+        # Empty string is only valid for cleared identifierForAdvertising; whitespace is never valid.
+        if any(ch.isspace() for ch in payload):
+            issues.append(f"parameter '{path}' contains whitespace: {payload!r}")
+    return issues
+
 
 # DabRequest
 dab_request_schema = {
@@ -31,7 +79,7 @@ list_supported_operation_response_schema = {
         "error": {"type": "string"},
         "operations": {
             "type": "array",
-            "items": {"type": "string"}
+            "items": NO_SPACE_STR
         }
     },
     "required": ["status", "operations"]
@@ -45,7 +93,7 @@ application_list_request_schema = dab_request_schema
 application_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "friendlyName": {"type": "string"},
         "version": {"type": "string"}
     },
@@ -71,10 +119,10 @@ list_applications_response_schema = {
 launch_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "parameters": {
             "type": "array",
-            "items": {"type": "string"}
+            "items": NO_SPACE_STR
         }
     },
     "required": ["appId"]
@@ -88,11 +136,11 @@ launch_application_response_schema = dab_response_schema
 launch_application_with_content_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
-        "contentId": {"type": "string"},
+        "appId": NO_SPACE_STR,
+        "contentId": NO_SPACE_STR,
         "parameters": {
             "type": "array",
-            "items": {"type": "string"}
+            "items": NO_SPACE_STR
         }
     },
     "required": ["appId", "contentId"]
@@ -106,7 +154,7 @@ launch_application_with_content_response_schema = dab_response_schema
 get_application_state_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"}
+        "appId": NO_SPACE_STR
     },
     "required": ["appId"]
 }
@@ -117,7 +165,7 @@ get_application_state_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "state": {"type": "string"}
+        "state": {"type": "string", "enum": ["STOPPED", "BACKGROUND", "FOREGROUND"]}
     },
     "required": ["status", "state"]
 }
@@ -127,8 +175,8 @@ get_application_state_response_schema = {
 exit_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
-        "force": {"type": "boolean"}
+        "appId": NO_SPACE_STR,
+        "background": {"type": "boolean"}
     },
     "required": ["appId"]
 }
@@ -139,7 +187,7 @@ exit_application_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "state": {"type": "string"}
+        "state": {"type": "string", "enum": ["STOPPED", "BACKGROUND", "FOREGROUND"]}
     },
     "required": ["status", "state"]
 }
@@ -147,7 +195,7 @@ exit_application_response_schema = {
 install_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "force": {"type": "boolean"}
     },
     "required": ["appId"]
@@ -168,7 +216,7 @@ install_application_response_schema = {
 uninstall_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "force": {"type": "boolean"}
     },
     "required": ["appId"]
@@ -188,7 +236,7 @@ uninstall_application_response_schema = {
 clear_data_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "force": {"type": "boolean"}
     },
     "required": ["appId"]
@@ -208,7 +256,7 @@ clear_data_application_response_schema = {
 install_from_appstore_application_request_schema = {
     "type": "object",
     "properties": {
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "force": {"type": "boolean"}
     },
     "required": ["appId"]
@@ -237,13 +285,13 @@ network_interface_schema = {
     "type": "object",
     "properties": {
         "connected": {"type": "boolean"},
-        "macAddress": {"type": "string"},
-        "ipAddress": {"type": ["string", "null"]},
+        "macAddress": NO_SPACE_STR,
+        "ipAddress": {"type": ["string", "null"], "pattern": r"^\S+$"},
         "dns": {
             "type": ["array", "null"],
-            "items": {"type": "string"}
+            "items": NO_SPACE_STR
         },
-        "type": {"type": "string"}
+        "type": {"type": "string", "enum": ["Ethernet", "Wifi", "Bluetooth", "Coax", "Other"]}
     },
     "required": ["connected", "macAddress", "type"]
 }
@@ -256,7 +304,7 @@ device_information_schema = {
         "error": {"type": ["string", "null"]},
         "manufacturer": {"type": "string"},
         "model": {"type": "string"},
-        "serialNumber": {"type": "string"},
+        "serialNumber": NO_SPACE_STR,
         "chipset": {"type": "string"},
         "firmwareVersion": {"type": "string"},
         "firmwareBuild": {"type": "string"},
@@ -264,15 +312,15 @@ device_information_schema = {
             "type": "array",
             "items": network_interface_schema
         },
-        "displayType": {"type": "string"},
+        "displayType": {"type": "string", "enum": ["Native", "External"]},
         "screenWidthPixels": {"type": "integer"},
         "screenHeightPixels": {"type": "integer"},
         "uptimeSince": {"type": ["string", "integer"]},
-        "deviceId": {"type": "string"}
+        "deviceId": NO_SPACE_STR
     },
     "required": ["status", "manufacturer", "model", "serialNumber", "chipset", 
                  "firmwareVersion", "firmwareBuild", "networkInterfaces", "displayType", 
-                 "screenWidthPixels", "screenHeightPixels", "uptimeSince", "deviceId"]
+                 "uptimeSince", "deviceId"]
 }
 
 # Operation: system/restart
@@ -288,135 +336,96 @@ settings_list_request_schema = dab_request_schema
 output_resolution_schema = {
     "type": "object",
     "properties": {
-        "width": {"type": "integer"},
-        "height": {"type": "integer"},
-        "frequency": {"type": "number"}
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "frequency": {"type": "number", "exclusiveMinimum": 0}
     },
-    "required": ["width", "height", "frequency"]
+    "required": ["width", "height", "frequency"],
+    "additionalProperties": False
 }
 
-# MatchContentFrameRate, HdrOutputMode, PictureMode, AudioOutputMode, AudioOutputSource, VideoInputSource
-# These are enums and can be represented as strings in a JSON schema.
+MATCH_CONTENT_FRAME_RATE_ENUM = ["EnabledAlways", "EnabledSeamlessOnly", "Disabled"]
+HDR_OUTPUT_MODE_ENUM = ["AlwaysHdr", "HdrOnPlayback", "DisableHdr"]
+PICTURE_MODE_ENUM = ["Standard", "Dynamic", "Movie", "Sports", "FilmMaker", "Game", "Auto"]
+AUDIO_OUTPUT_MODE_ENUM = ["Stereo", "MultichannelPcm", "PassThrough", "Auto"]
+AUDIO_OUTPUT_SOURCE_ENUM_20 = ["NativeSpeaker", "Arc", "EArc", "Optical", "Aux", "Bluetooth", "Auto", "HDMI"]
+AUDIO_OUTPUT_SOURCE_ENUM_21 = ["NativeSpeaker", "Arc", "EArc", "Optical", "Aux", "WirelessSpeakers", "Auto", "HDMI"]
+VIDEO_INPUT_SOURCE_ENUM_20 = ["Tuner", "HDMI1", "HDMI2", "HDMI3", "HDMI4", "Composite", "Component", "Home", "Cast"]
+VIDEO_INPUT_SOURCE_ENUM_21 = ["Tuner", "HDMI1", "HDMI2", "HDMI3", "HDMI4", "Composite", "Component", "USB", "Home", "Cast"]
 
-# ListSystemSettings
+numeric_range_schema = {
+    "type": "object",
+    "properties": {
+        "min": {"type": "integer"},
+        "max": {"type": "integer"}
+    },
+    "required": ["min", "max"],
+    "additionalProperties": False
+}
+
+# ListSystemSettings (structural/type validation; partner enum names and extra keys allowed)
+_non_empty_str_array = {"type": "array", "items": NO_SPACE_STR}
+
 list_system_settings_schema = {
     "type": "object",
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": ["string", "null"]},
-        "language": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "outputResolution": {
-            "type": "array",
-            "items": output_resolution_schema
-        },
+        "language": {"type": "array", "items": {"type": "string", "minLength": 2, "pattern": r"^\S+$"}},
+        "outputResolution": {"type": "array", "items": output_resolution_schema},
         "memc": {"type": "boolean"},
         "cec": {"type": "boolean"},
         "lowLatencyMode": {"type": "boolean"},
-        "matchContentFrameRate": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "hdrOutputMode": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "pictureMode": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "audioOutputMode": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "audioOutputSource": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "videoInputSource": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "audioVolume": {
-            "type": "object",
-            "properties": {
-                "min": {"type": "integer"},
-                "max": {"type": "integer"}
-            },
-            "required": ["min", "max"]
-        },
+        "matchContentFrameRate": _non_empty_str_array,
+        "hdrOutputMode": _non_empty_str_array,
+        "pictureMode": _non_empty_str_array,
+        "audioOutputMode": _non_empty_str_array,
+        "audioOutputSource": _non_empty_str_array,
+        "videoInputSource": _non_empty_str_array,
+        "audioVolume": numeric_range_schema,
         "mute": {"type": "boolean"},
-        "textToSpeech": {"type": "boolean"}
+        "textToSpeech": {"type": "boolean"},
     },
 }
 
 list_system_settings_schema_20 = {
-    "allOf": [list_system_settings_schema],
-    "required": ["status", "language", "outputResolution", "memc", "cec", "lowLatencyMode",
-                 "matchContentFrameRate", "hdrOutputMode", "pictureMode", "audioOutputMode",
-                 "audioOutputSource", "videoInputSource", "mute", "textToSpeech"]
+    "type": "object",
+    "properties": list_system_settings_schema["properties"],
+    "required": ["status"],
 }
 
 list_system_settings_schema_21 = {
-    "allOf": [list_system_settings_schema],
+    "type": "object",
     "properties": {
-        "brightness": {
-            "type": "object",
-            "properties": {
-                "min": {"type": "integer"},
-                "max": {"type": "integer"}
-            },
-            "required": ["min", "max"]
-        },
-        "contrast": {
-            "type": "object",
-            "properties": {
-                "min": {"type": "integer"},
-                "max": {"type": "integer"}
-            },
-            "required": ["min", "max"]
-        },
-        "timeZone": {"type": "boolean"},
+        **list_system_settings_schema["properties"],
+        "brightness": numeric_range_schema,
+        "contrast": numeric_range_schema,
+        "timeZone": _non_empty_str_array,
         "screenSaver": {"type": "boolean"},
-        "screenSaverMinTimeout": {"type": "integer"},
+        "screenSaverMinTimeout": {"type": "integer", "minimum": 0, "maximum": 60},
         "personalizedAds": {"type": "boolean"},
         "highContrastText": {"type": "boolean"},
         "identifierForAdvertising": {"type": "boolean"},
     },
-    "required": ["status", "language", "outputResolution", "memc", "cec", "lowLatencyMode",
-                 "matchContentFrameRate", "hdrOutputMode", "pictureMode", "audioOutputMode",
-                 "audioOutputSource", "videoInputSource", "audioVolume", "mute", "textToSpeech",
-                 "timeZone", "screenSaver",
-                 "personalizedAds", "highContrastText", "identifierForAdvertising"]
+    "required": ["status"],
 }
 
 system_settings_schema = {
     "status": {"type": "integer"},
-    "language": {"type": "string"},
+    "language": {"type": "string", "minLength": 2, "pattern": r"^\S+$"},
     "outputResolution": output_resolution_schema,
     "memc": {"type": "boolean"},
     "cec": {"type": "boolean"},
     "lowLatencyMode": {"type": "boolean"},
-    "matchContentFrameRate": {"type": "string"},
-    "hdrOutputMode": {"type": "string"},
-    "pictureMode": {"type": "string"},
-    "audioOutputMode": {"type": "string"},
-    "audioOutputSource": {"type": "string"},
-    "videoInputSource": {"type": "string"},
+    "matchContentFrameRate": NO_SPACE_STR,
+    "hdrOutputMode": NO_SPACE_STR,
+    "pictureMode": NO_SPACE_STR,
+    "audioOutputMode": NO_SPACE_STR,
+    "audioOutputSource": NO_SPACE_STR,
+    "videoInputSource": NO_SPACE_STR,
     "audioVolume": {"type": "integer"},
     "mute": {"type": "boolean"},
     "textToSpeech": {"type": "boolean"},
-    "brightness": {"type": "integer"},
-    "contrast": {"type": "integer"},
-    "timeZone": {"type": "string"},
-    "screenSaver": {"type": "boolean"},
-    "screenSaverTimeout": {"type": "integer"},
-    "screenSaverMinTimeout": {"type": "integer"},
-    "personalizedAds": {"type": "boolean"},
-    "highContrastText": {"type": "boolean"},
-    "identifierForAdvertising": {"type": "string"},
 }
 
 # Operation: system/settings/get
@@ -435,7 +444,6 @@ get_system_settings_response_schema = {
     },
     "then": {
         "properties": system_settings_schema,
-        "additionalProperties": False
     },
     "else": {
         "properties": {
@@ -443,8 +451,6 @@ get_system_settings_response_schema = {
         },
         "required": ["error"]
     },
-
-    "unevaluatedProperties": False
 }
 
 # SetSystemSettingsResponse
@@ -462,7 +468,6 @@ set_system_settings_response_schema = {
     },
     "then": {
         "properties": system_settings_schema,
-        "additionalProperties": False
     },
     "else": {
         "properties": {
@@ -470,8 +475,32 @@ set_system_settings_response_schema = {
         },
         "required": ["error"]
     },
+}
 
-    "unevaluatedProperties": False
+system_settings_schema_21 = {
+    **system_settings_schema,
+    "brightness": {"type": "integer"},
+    "contrast": {"type": "integer"},
+    "timeZone": NO_SPACE_STR,
+    "screenSaver": {"type": "boolean"},
+    "screenSaverTimeout": {"type": "integer", "minimum": 1},
+    "personalizedAds": {"type": "boolean"},
+    "highContrastText": {"type": "boolean"},
+    "identifierForAdvertising": NO_SPACE_OPT_EMPTY_STR,
+}
+
+get_system_settings_response_schema_21 = {
+    **get_system_settings_response_schema,
+    "then": {
+        "properties": system_settings_schema_21,
+    },
+}
+
+set_system_settings_response_schema_21 = {
+    **set_system_settings_response_schema,
+    "then": {
+        "properties": system_settings_schema_21,
+    },
 }
 
 # Operation: input/key/list
@@ -483,7 +512,7 @@ key_list_schema = {
         "error": {"type": ["string", "null"]},
         "keyCodes": {
             "type": "array",
-            "items": {"type": "string"}
+            "items": NO_SPACE_STR
         },
     },
     "required": ["status", "keyCodes"]
@@ -495,7 +524,7 @@ key_press_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "keyCode": {"type": "string"},
+        "keyCode": NO_SPACE_STR,
     },
     "required": ["id", "keyCode"]
 }
@@ -506,7 +535,7 @@ long_key_press_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "keyCode": {"type": "string"},
+        "keyCode": NO_SPACE_STR,
         "durationMs": {"type": "integer"},
     },
     "required": ["id", "keyCode", "durationMs"]
@@ -528,7 +557,7 @@ output_image_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "outputLocation": {"type": "string"},
+        "outputLocation": NO_SPACE_STR,
     },
     "required": ["id", "outputLocation"]
 }
@@ -538,7 +567,7 @@ output_image_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": ["string", "null"]},
-        "outputImage": {"type": "string"},
+        "outputImage": {"type": "string", "pattern": r"^data:image/png;base64,\S+$"},
     },
     "required": ["status", "outputImage"]
 }
@@ -589,7 +618,7 @@ start_app_telemetry_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
         "duration": {"type": "number"},
     },
     "required": ["id", "appId", "duration"]
@@ -611,7 +640,7 @@ stop_app_telemetry_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "appId": {"type": "string"},
+        "appId": NO_SPACE_STR,
     },
     "required": ["id", "appId"]
 }
@@ -666,7 +695,7 @@ list_voice_response_schema = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "name": NO_SPACE_STR,
                     "enabled": {"type": "boolean"},
                 },
                 "required": ["name", "enabled"]
@@ -685,7 +714,7 @@ set_voice_system_request_schema = {
         "voiceSystem": {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
+                "name": NO_SPACE_STR,
                 "enabled": {"type": "boolean"},
             },
             "required": ["name", "enabled"]
@@ -702,7 +731,7 @@ set_voice_system_response_schema = {
         "voiceSystem": {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
+                "name": NO_SPACE_STR,
                 "enabled": {"type": "boolean"},
             },
             "required": ["name", "enabled"]
@@ -717,8 +746,8 @@ send_audio_request_schema = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
-        "fileLocation": {"type": "string"},
-        "voiceSystem": {"type": ["string", "null"]},
+        "fileLocation": NO_SPACE_STR,
+        "voiceSystem": {"type": ["string", "null"], "pattern": r"^\S+$"},
     },
     "required": ["id", "fileLocation"]
 }
@@ -739,7 +768,7 @@ send_text_request_schema = {
     "properties": {
         "id": {"type": "string"},
         "requestText": {"type": "string"},
-        "voiceSystem": {"type": "string"},
+        "voiceSystem": NO_SPACE_STR,
     },
     "required": ["id", "requestText", "voiceSystem"]
 }
@@ -768,8 +797,8 @@ discovery_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": ["string", "null"]},
-        "ip": {"type": "string"},
-        "deviceId": {"type": "string"},
+        "ip": NO_SPACE_STR,
+        "deviceId": NO_SPACE_STR,
     },
     "required": ["status", "ip", "deviceId"]
 }
@@ -791,8 +820,10 @@ version_response_schema = {
         "error": {"type": ["string", "null"]},
         "versions": {
             "type": "array",
+            "minItems": 1,
             "items": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[0-9]+\\.[0-9]+$"
             }
         },
     },
@@ -821,7 +852,7 @@ stop_log_collection_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "logArchive": {"type": "string"},
+        "logArchive": NO_SPACE_STR,
         "remainingChunks": {"type": "integer"}
     },
     "required": ["status", "logArchive", "remainingChunks"]
@@ -837,7 +868,7 @@ power_mode_get_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "powerMode": {"type": "string"}
+        "powerMode": {"type": "string", "enum": ["Active", "Standby", "DeepSleep"]}
     },
     "required": ["status", "powerMode"]
 }
@@ -847,7 +878,7 @@ power_mode_get_response_schema = {
 power_mode_set_request_schema = {
     "type": "object",
     "properties": {
-        "powerMode": {"type": "string"}
+        "powerMode": {"type": "string", "enum": ["Active", "Standby", "DeepSleep"]}
     },
     "required": ["powerMode"]
 }
@@ -858,7 +889,7 @@ power_mode_set_response_schema = {
     "properties": {
         "status": {"type": "integer"},
         "error": {"type": "string"},
-        "powerMode": {"type": "string"}
+        "powerMode": {"type": "string", "enum": ["Active", "Standby", "DeepSleep"]}
     },
     "required": ["status", "powerMode"]
 }
@@ -868,7 +899,7 @@ power_mode_set_response_schema = {
 content_open_request_schema = {
     "type": "object",
     "properties": {
-        "entryId": {"type": "string"}
+        "entryId": NO_SPACE_STR
     },
     "required": ["entryId"]
 }
@@ -886,13 +917,16 @@ content_entries_schema = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "entryId": {"type": "string"},
+                    "entryId": NO_SPACE_STR,
                     "title": {"type": "string"},
-                    "appId": {"type": "string"},
-                    "poster": {"type": "string"},
+                    "appId": NO_SPACE_STR,
+                    "poster": NO_SPACE_STR,
                     "categories": {
                         "type": "array",
-                        "items": {"type": "string"}
+                        "items": {
+                            "type": "string",
+                            "enum": ["ContinueWatching", "Movies", "TvShows", "LiveEvents", "LinearTv", "Video", "Trending", "Others"]
+                        }
                     }
                 },
                 "required": ["entryId", "title", "appId", "poster", "categories"]
@@ -978,19 +1012,27 @@ class dab_response_validator(object):
 
     @staticmethod
     def validate_list_system_settings_schema(response):
+        """Validate system/settings/list against DAB 2.0 (all 14 required) or 2.1 (optional omitted) schema."""
+        import dab_tester
         dab_version = dab_tester.DAB_VERSION or "2.0"
         if dab_version == "2.0":
             validate(instance=jsons.loads(response), schema=list_system_settings_schema_20)
-        elif dab_version == "2.1":
+        else:
             validate(instance=jsons.loads(response), schema=list_system_settings_schema_21)
 
     @staticmethod
     def validate_get_system_settings_response_schema(response):
-        validate(instance=jsons.loads(response), schema=get_system_settings_response_schema)
+        """Validate system/settings/get against version-specific SystemSettings schema (excluding read-only keys)."""
+        import dab_tester
+        schema = get_system_settings_response_schema_21 if (dab_tester.DAB_VERSION or "2.0") >= "2.1" else get_system_settings_response_schema
+        validate(instance=jsons.loads(response), schema=schema)
 
     @staticmethod
     def validate_set_system_settings_response_schema(response):
-        validate(instance=jsons.loads(response), schema=set_system_settings_response_schema)
+        """Validate system/settings/set response against version-specific SystemSettings schema."""
+        import dab_tester
+        schema = set_system_settings_response_schema_21 if (dab_tester.DAB_VERSION or "2.0") >= "2.1" else set_system_settings_response_schema
+        validate(instance=jsons.loads(response), schema=schema)
 
     @staticmethod
     def validate_key_list_schema(response):
