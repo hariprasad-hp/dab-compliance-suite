@@ -15,11 +15,551 @@ from util.enforcement_manager import ValidateCode
 from util.config_loader import resolve_body_or_raise, PayloadConfigError
 from util.output_image_handler import handle_output_image_response
 from sys import exit as sys_exit
+import sys
 import re
 import time
 from packaging.version import Version, InvalidVersion
 
+from collections import Counter
+
 DAB_VERSION = "2.0" # default dab version is 2.0, this global value will be used in system/settings/... operations.
+MAX_INLINE_RESPONSE_BYTES = 4096
+VALID_DAB_STATUS_CODES = frozenset({200, 400, 404, 500, 501})
+_INTERACTIVE_ACK_ENABLED = False
+_SESSION_ITEM_ACKS = {}
+
+_KEY_LOCALES = (
+    "de-DE", "en-CA", "en-GB", "en-IN", "en-US",
+    "es-ES", "es-MX", "fr-FR", "hi-IN", "ja-JP",
+    "ko-KR", "pt-BR", "zh-Hans-CN", "zh-Hant-TW",
+)
+
+_PROSE_KEYS = frozenset({
+    "error", "message", "statusText", "friendlyName", "version", "manufacturer",
+    "model", "chipset", "firmwareVersion", "firmwareBuild", "uptimeSince",
+    "title", "requestText", "searchText", "details",
+})
+
+_KEY_CATEGORY_SPECS = (
+    ("Navigation & System", (
+        "KEY_POWER", "KEY_HOME", "KEY_MENU", "KEY_BACK", "KEY_EXIT",
+        "KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT", "KEY_ENTER",
+    )),
+    ("Volume & Channel", (
+        "KEY_VOLUME_UP", "KEY_VOLUME_DOWN", "KEY_MUTE",
+        "KEY_CHANNEL_UP", "KEY_CHANNEL_DOWN", "KEY_PAGE_UP", "KEY_PAGE_DOWN",
+    )),
+    ("Guide & Captions", ("KEY_GUIDE", "KEY_INFO", "KEY_CAPTIONS")),
+    ("Media Playback", (
+        "KEY_PLAY", "KEY_PAUSE", "KEY_PLAY_PAUSE", "KEY_STOP", "KEY_RECORD",
+        "KEY_REWIND", "KEY_FAST_FORWARD", "KEY_SKIP_REWIND", "KEY_SKIP_FAST_FORWARD",
+    )),
+    ("Color Keys", ("KEY_RED", "KEY_GREEN", "KEY_YELLOW", "KEY_BLUE")),
+)
+_NUMERIC_KEYS = tuple(f"KEY_{d}" for d in range(10))
+
+
+def _is_interactive_ack_session() -> bool:
+    if os.environ.get("DAB_NON_INTERACTIVE") == "1":
+        return False
+    if os.environ.get("DAB_FORCE_INTERACTIVE") == "1":
+        return True
+    return _INTERACTIVE_ACK_ENABLED and bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+
+def _safe_input(prompt: str, default: str = "") -> str:
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return default
+
+
+def _parse_unsupported_item(raw_item: str):
+    """Split 'memc (false)' -> ('memc', 'false'), or 'content/search' -> ('content/search', '')."""
+    s = str(raw_item).strip()
+    if " (" in s and s.endswith(")"):
+        name, detail = s.split(" (", 1)
+        return name.strip(), detail[:-1].strip()
+    return s, ""
+
+
+def _item_cache_key(category: str, item_name: str) -> str:
+    if category in ("system/settings/list", "system/settings/set"):
+        return f"setting:{item_name}"
+    if category in ("input/key/list", "input/key-press", "input/long-key-press"):
+        return f"key:{item_name}"
+    if category.startswith("voice/"):
+        return f"voice:{item_name}"
+    return f"op:{item_name}"
+
+
+def AcknowledgeUnsupported(test_result, category: str, unsupported_items: list) -> bool:
+    """
+    Prompt operator individually for EACH unsupported operation/setting/key/voice item
+    and store the per-item reasons in test_result.operation_not_supported_ack and logs.
+    """
+    if not unsupported_items:
+        return True
+
+    parsed_items = [_parse_unsupported_item(x) for x in unsupported_items]
+    raw_labels = [str(x) for x in unsupported_items]
+    log(
+        test_result,
+        f"[UNSUPPORTED_CLAIM] {category} ({len(raw_labels)}): {', '.join(raw_labels)}",
+    )
+
+    device_id = getattr(test_result, "device_id", "device")
+    interactive = _is_interactive_ack_session()
+    ack_map = dict(getattr(test_result, "operation_not_supported_ack", None) or {})
+
+    unprompted = [
+        (idx, name, detail, raw)
+        for idx, ((name, detail), raw) in enumerate(zip(parsed_items, raw_labels), 1)
+        if _item_cache_key(category, name) not in _SESSION_ITEM_ACKS
+    ]
+
+    if interactive and unprompted:
+        border = "─" * 74
+        LOGGER.prompt(f"┌─ Not Supported Acknowledgment ({category} on {device_id}) {border[:max(2, 34 - len(category) - len(device_id))]}")
+        LOGGER.result(f"│ {len(unprompted)} unsupported item(s) claimed — enter reason/explanation for each:")
+        LOGGER.result(f"└{border}")
+
+    total = len(parsed_items)
+    for idx, ((name, detail), raw) in enumerate(zip(parsed_items, raw_labels), 1):
+        ckey = _item_cache_key(category, name)
+        if ckey in _SESSION_ITEM_ACKS:
+            reason = _SESSION_ITEM_ACKS[ckey]
+        elif not interactive:
+            reason = "Recorded automatically in non-interactive session."
+        else:
+            detail_str = f" ({detail})" if detail else ""
+            reason = _safe_input(
+                f"  [{idx}/{total}] Reason '{name}'{detail_str} is not supported: "
+            )
+            if not reason:
+                reason = _safe_input(
+                    f"  [{idx}/{total}] Enter brief reason for '{name}' (or Enter for 'Not supported on device'): "
+                ) or "Not supported on device."
+            _SESSION_ITEM_ACKS[ckey] = reason
+
+        ack_map[name] = reason
+        log(test_result, f"[OPERATION_NOT_SUPPORTED_ACK] {raw}: {reason}")
+
+    test_result.operation_not_supported_ack = ack_map
+    return True
+
+
+def _check_non_prose_whitespace(payload, path: str = "") -> list:
+    """Detect invalid whitespace in DAB parameter names or identifier/code/setting values."""
+    issues = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            ks = str(k)
+            cur = f"{path}.{ks}" if path else ks
+            if any(ch.isspace() for ch in ks):
+                issues.append(f"parameter name {cur!r} contains whitespace")
+            if ks in _PROSE_KEYS:
+                continue
+            issues.extend(_check_non_prose_whitespace(v, cur))
+    elif isinstance(payload, list):
+        for i, item in enumerate(payload):
+            issues.extend(_check_non_prose_whitespace(item, f"{path}[{i}]"))
+    elif isinstance(payload, str):
+        if any(ch.isspace() for ch in payload):
+            issues.append(f"parameter '{path}' contains whitespace: {payload!r}")
+    return issues
+
+
+def _parse_native_json_or_str(raw_value):
+    """Parse raw request/response into a native Python dict/list (no '\"' escaping in JSON)."""
+    if raw_value is None:
+        return {}
+    if isinstance(raw_value, (dict, list)):
+        return raw_value
+    text = str(raw_value).strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                import ast
+                chunks = ast.literal_eval(text)
+                if isinstance(chunks, list):
+                    return json.loads(" ".join(str(x) for x in chunks if str(x)))
+            except Exception:
+                pass
+        return re.sub(r"\s*\r?\n\s*", " ", text).strip()
+
+
+def _describe_large_fields(parsed_obj) -> str:
+    """Identify which fields made a DAB response exceed MAX_INLINE_RESPONSE_BYTES."""
+    if not isinstance(parsed_obj, dict):
+        return "large payload"
+    heavy = []
+    for k, v in parsed_obj.items():
+        if isinstance(v, list) and len(v) > 20:
+            heavy.append(f"{k}[{len(v)}]")
+        elif isinstance(v, str) and len(v) > 512:
+            heavy.append(f"{k} ({len(v)} chars)")
+    return ", ".join(heavy) if heavy else "large payload"
+
+
+def _prepare_response_for_json(test_result, topic: str, raw_resp, clean_logs: list, logger=None):
+    """
+    Return native inline JSON object for normal responses (<= 4 KB, zero '\"' escapes),
+    or omit oversized responses (> 4 KB / heavy binary topics) and print + log why.
+    """
+    preset_bytes = getattr(test_result, "_raw_response_bytes", None)
+    preset_status = getattr(test_result, "_raw_status_code", None)
+
+    if topic in {"system/logs/stop-collection", "output/image"}:
+        size_b = preset_bytes if isinstance(preset_bytes, int) else len(str(raw_resp or "").encode("utf-8"))
+        reason = (
+            f"Raw response ({size_b} bytes) not stored in results JSON: "
+            f"binary/base64 payload for '{topic}' exceeds {MAX_INLINE_RESPONSE_BYTES}-byte inline limit."
+        )
+        if logger is not None:
+            logger.warn(f"[RESPONSE_OMITTED] {test_result.test_id}: {reason}")
+        if not any("[RESPONSE_OMITTED]" in ln for ln in clean_logs):
+            clean_logs.append(f"[RESPONSE_OMITTED] {reason}")
+        out = {"omitted": True, "size_bytes": size_b, "reason": reason}
+        if isinstance(preset_status, int) and preset_status > 0:
+            out["status"] = preset_status
+        return out
+
+    parsed = _parse_native_json_or_str(raw_resp)
+    compact_str = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False) if isinstance(parsed, (dict, list)) else str(parsed)
+    size_b = len(compact_str.encode("utf-8"))
+
+    if size_b > MAX_INLINE_RESPONSE_BYTES:
+        heavy_desc = _describe_large_fields(parsed)
+        reason = (
+            f"Raw response ({size_b} bytes) not stored in results JSON: "
+            f"exceeds {MAX_INLINE_RESPONSE_BYTES}-byte inline limit ({heavy_desc}); see formatted summary in logs."
+        )
+        if logger is not None:
+            logger.warn(f"[RESPONSE_OMITTED] {test_result.test_id}: {reason}")
+        if not any("[RESPONSE_OMITTED]" in ln for ln in clean_logs):
+            clean_logs.insert(0, f"[RESPONSE_OMITTED] {reason}")
+        out = {"omitted": True, "size_bytes": size_b, "reason": reason}
+        if isinstance(parsed, dict) and isinstance(parsed.get("status"), int):
+            out["status"] = parsed["status"]
+        return out
+
+    return parsed
+
+
+def _build_outcome_summary(test_result, verdict: str, clean_logs: list) -> dict:
+    """Build concise 'outcome' containing latency metrics and failure/skip/pass reason (no duplicate status)."""
+    exp_ms = getattr(test_result, "_expected_latency_ms", None)
+    act_ms = getattr(test_result, "_actual_latency_ms", None)
+
+    if act_ms is None:
+        for ln in clean_logs:
+            m = re.search(r"Latency,\s*Expected:\s*(\d+)\s*ms,\s*Actual:\s*(\d+)\s*ms", ln)
+            if m:
+                exp_ms = int(m.group(1))
+                act_ms = int(m.group(2))
+                break
+
+    latency_obj = None
+    if isinstance(act_ms, int):
+        if isinstance(exp_ms, int) and exp_ms > 0:
+            latency_obj = {
+                "expected_ms": exp_ms,
+                "actual_ms": act_ms,
+                "passed": act_ms <= exp_ms,
+            }
+        else:
+            latency_obj = {"actual_ms": act_ms}
+
+    reasons = []
+    if verdict == "PASS":
+        neg_pass = [ln for ln in clean_logs if "NEGATIVE TEST PASSED" in ln]
+        if neg_pass:
+            cleaned = re.sub(r"^\[\s*NEGATIVE TEST PASSED\s*-?\s*", "", neg_pass[0]).rstrip(" ]")
+            reason_text = f"Negative test passed ({cleaned})" if cleaned else "Negative test passed"
+        else:
+            reason_text = "Passed all validations"
+    else:
+        for ln in clean_logs:
+            s = ln.strip()
+            if "took more time than expected" in s:
+                if isinstance(act_ms, int) and isinstance(exp_ms, int):
+                    reasons.append(f"Latency {act_ms} ms exceeded expected {exp_ms} ms")
+                else:
+                    reasons.append(s)
+            elif s.startswith("[FAILED]"):
+                reasons.append(s[len("[FAILED]"):].strip())
+            elif s.startswith("[ FAILED -"):
+                reasons.append(s[len("[ FAILED -"):].rstrip(" ]").strip())
+            elif s.startswith("[ OPTIONAL_FAILED -"):
+                reasons.append(s[len("[ OPTIONAL_FAILED -"):].rstrip(" ]").strip())
+            elif s.startswith("[OPTIONAL_FAILED]"):
+                reasons.append(s[len("[OPTIONAL_FAILED]"):].strip())
+            elif s.startswith("[ SKIPPED -"):
+                reasons.append(s[len("[ SKIPPED -"):].rstrip(" ]").strip())
+            elif s.startswith("Error Code:"):
+                reasons.append(s)
+        deduped = []
+        for r in reasons:
+            if r and r not in deduped:
+                deduped.append(r)
+        if deduped:
+            reason_text = "; ".join(deduped)
+        elif verdict == "OPTIONAL_FAILED":
+            reason_text = "Operation or capability not supported by device"
+        elif verdict == "SKIPPED":
+            reason_text = "Test skipped"
+        else:
+            reason_text = "Validation failed"
+
+    return {
+        "latency": latency_obj,
+        "reason": reason_text,
+    }
+
+
+def _dumps_result_document(value, level: int = 0, key_name: str = "") -> str:
+    """
+    Serialize result JSON with 2-space indentation while keeping 'request', 'response',
+    and 'latency' as single-line native JSON objects (zero '\"' string escaping).
+    """
+    if key_name in {"request", "response", "latency"}:
+        return json.dumps(value, ensure_ascii=False)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return json.dumps(value, ensure_ascii=False)
+
+    pad = "  " * level
+    child_pad = "  " * (level + 1)
+
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        items = list(value.items())
+        lines = ["{"]
+        for idx, (k, v) in enumerate(items):
+            comma = "," if idx < len(items) - 1 else ""
+            rendered = _dumps_result_document(v, level + 1, key_name=str(k))
+            lines.append(f"{child_pad}{json.dumps(str(k), ensure_ascii=False)}: {rendered}{comma}")
+        lines.append(f"{pad}}}")
+        return "\n".join(lines)
+
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        lines = ["["]
+        for idx, item in enumerate(value):
+            comma = "," if idx < len(value) - 1 else ""
+            rendered = _dumps_result_document(item, level + 1, key_name="")
+            lines.append(f"{child_pad}{rendered}{comma}")
+        lines.append(f"{pad}]")
+        return "\n".join(lines)
+
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _scrub_data_uris(val):
+    """Shorten inline data:...;base64 blobs when displaying human-readable logs."""
+    if isinstance(val, str) and val.startswith("data:") and ";base64," in val:
+        header, b64 = val.split(";base64,", 1)
+        return f"<{header};base64 ({len(b64)} chars)>"
+    if isinstance(val, dict):
+        return {k: _scrub_data_uris(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_scrub_data_uris(x) for x in val]
+    return val
+
+
+def _log_grouped_keycodes(test_result, keys: list):
+    """Format keyCodes by remote-control category (Navigation, Volume/Channel, Media, Color, Numeric, Custom)."""
+    strs = [str(k) for k in keys if k is not None]
+    key_set = set(strs)
+    known = set(_NUMERIC_KEYS)
+    for _, grp_keys in _KEY_CATEGORY_SPECS:
+        known.update(grp_keys)
+
+    custom = [k for k in strs if k not in known]
+    std_count = len(strs) - len(custom)
+    summary_extra = f" ({std_count} standard, {len(custom)} partner/custom)" if custom else f" ({std_count} standard)"
+    log(test_result, f"keyCodes: {len(strs)} supported{summary_extra}")
+
+    for label, grp_keys in _KEY_CATEGORY_SPECS:
+        present = [k for k in grp_keys if k in key_set]
+        if present:
+            log(test_result, f"  • {label} ({len(present)}): {', '.join(present)}")
+
+    present_num = [k for k in _NUMERIC_KEYS if k in key_set]
+    if len(present_num) == 10:
+        log(test_result, "  • Numeric Keys (10): KEY_0 .. KEY_9")
+    elif present_num:
+        log(test_result, f"  • Numeric Keys ({len(present_num)}): {', '.join(present_num)}")
+
+    if custom:
+        log(test_result, f"  • Partner / Custom ({len(custom)}): {', '.join(custom)}")
+
+
+def _log_grouped_operations(test_result, ops: list):
+    """Format operations/list grouped cleanly by DAB domain namespace (including 3P domains)."""
+    strs = [str(op) for op in ops if op is not None]
+    domain_order = ["applications", "system", "input", "voice", "content", "telemetry", "core"]
+    buckets = {d: [] for d in domain_order}
+    extra_domains = {}
+
+    for op in strs:
+        if "telemetry/" in op:
+            buckets["telemetry"].append(op)
+        elif "/" in op:
+            prefix, rest = op.split("/", 1)
+            if prefix in buckets:
+                buckets[prefix].append(rest)
+            elif prefix in ("device", "health-check", "output", "operations"):
+                buckets["core"].append(op)
+            else:
+                extra_domains.setdefault(prefix, []).append(rest)
+        else:
+            buckets["core"].append(op)
+
+    log(test_result, f"operations: {len(strs)} supported")
+    labels = {
+        "applications": "Applications",
+        "system": "System",
+        "input": "Input",
+        "voice": "Voice",
+        "content": "Content",
+        "telemetry": "Telemetry",
+        "core": "Core & Device",
+    }
+    for dom in domain_order:
+        items = buckets[dom]
+        if items:
+            log(test_result, f"  • {labels[dom]} ({len(items)}): {', '.join(items)}")
+    for dom, items in sorted(extra_domains.items()):
+        log(test_result, f"  • {dom} ({len(items)}): {', '.join(items)}")
+
+
+def _summarize_languages_for_log(langs: list) -> str:
+    """Summarize large 3P/OEM language lists safely regardless of locale naming convention."""
+    strs = [str(x) for x in langs if x is not None]
+    prefixes = Counter(re.split(r"[-_]", s)[0] for s in strs if s)
+    common = [loc for loc in _KEY_LOCALES if loc in set(strs)]
+    sample_str = ", ".join((common or strs)[:10])
+    top_str = ", ".join(f"{k}: {v}" for k, v in prefixes.most_common(6))
+    return (
+        f"language: {len(strs)} supported across {len(prefixes)} languages "
+        f"(common: {sample_str} | top: {top_str})"
+    )
+
+
+def _summarize_timezones_for_log(zones: list) -> str:
+    """Summarize large 3P/OEM timeZone lists safely (supports IANA '/' or UTC/GMT offsets)."""
+    strs = [str(x) for x in zones if x is not None]
+    if any("/" in s for s in strs):
+        groups = dict(sorted(Counter(s.split("/")[0] for s in strs if s).items()))
+        grp_str = ", ".join(f"{k}: {v}" for k, v in list(groups.items())[:12])
+        return f"timeZone: {len(strs)} supported ({grp_str})"
+    sample_str = ", ".join(strs[:8]) + (f", ... (+{len(strs) - 8} more)" if len(strs) > 8 else "")
+    return f"timeZone: {len(strs)} supported ({sample_str})"
+
+
+def _format_response_for_logs(test_result, topic: str, obj):
+    """
+    Format standard and 3P DAB responses into clean, domain-grouped lines in TestResult.logs
+    without index-slice clutter or 600-line raw dumps.
+    """
+    try:
+        clean_obj = _scrub_data_uris(obj)
+        is_settings_list = (topic == "system/settings/list")
+
+        if isinstance(clean_obj, dict):
+            for key, value in clean_obj.items():
+                try:
+                    if key == "keyCodes" and isinstance(value, list) and value:
+                        _log_grouped_keycodes(test_result, value)
+                    elif key == "operations" and isinstance(value, list) and value:
+                        _log_grouped_operations(test_result, value)
+                    elif key == "language" and isinstance(value, list) and len(value) > 12:
+                        log(test_result, _summarize_languages_for_log(value))
+                    elif key == "timeZone" and isinstance(value, list) and len(value) > 12:
+                        log(test_result, _summarize_timezones_for_log(value))
+                    elif key == "applications" and isinstance(value, list):
+                        log(test_result, f"applications: {len(value)} installed")
+                        for app in value:
+                            if isinstance(app, dict):
+                                aid = app.get("appId", "?")
+                                fname = app.get("friendlyName")
+                                ver = app.get("version")
+                                meta = ", ".join(
+                                    p for p in (
+                                        f"name={fname}" if fname and fname != aid else "",
+                                        f"version={ver}" if ver else "",
+                                    ) if p
+                                )
+                                log(test_result, f"  • {aid}" + (f" ({meta})" if meta else ""))
+                            else:
+                                log(test_result, f"  • {app}")
+                    elif key == "voiceSystems" and isinstance(value, list):
+                        if not value:
+                            log(test_result, "voiceSystems: [] (not supported)")
+                        else:
+                            parts = [
+                                f"{vs.get('name', '?')} ({'enabled' if vs.get('enabled') else 'disabled'})"
+                                if isinstance(vs, dict) else str(vs)
+                                for vs in value
+                            ]
+                            log(test_result, f"voiceSystems ({len(value)}): {', '.join(parts)}")
+                    elif isinstance(value, list):
+                        if len(value) == 0:
+                            suffix = " (not supported)" if is_settings_list else ""
+                            log(test_result, f"{key}: []{suffix}")
+                        elif all(isinstance(x, dict) and {"width", "height", "frequency"}.issubset(x.keys()) for x in value):
+                            modes = [f"{x['width']}x{x['height']}@{x['frequency']}Hz" for x in value]
+                            log(test_result, f"{key} ({len(modes)}): {', '.join(modes)}")
+                        elif all(isinstance(x, dict) for x in value):
+                            log(test_result, f"{key}: {len(value)} item(s)")
+                            for item_dict in value:
+                                pairs = ", ".join(
+                                    f"{dk}={json.dumps(dv, ensure_ascii=False) if isinstance(dv, (list, dict)) else dv}"
+                                    for dk, dv in item_dict.items()
+                                )
+                                log(test_result, f"  • {pairs}")
+                        else:
+                            items = [
+                                json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else str(x)
+                                for x in value
+                            ]
+                            if len(items) <= 15:
+                                log(test_result, f"{key} ({len(items)}): {', '.join(items)}")
+                            else:
+                                sample = ", ".join(items[:12])
+                                log(test_result, f"{key} ({len(items)}): {sample}, ... (+{len(items) - 12} more)")
+                    elif isinstance(value, dict):
+                        if {"min", "max"}.issubset(value.keys()) and len(value) == 2 and all(isinstance(v, (int, float)) for v in value.values()):
+                            if is_settings_list and value["min"] >= value["max"]:
+                                log(test_result, f"{key}: {{min: {value['min']}, max: {value['max']}}} (not supported)")
+                            else:
+                                log(test_result, f"{key}: {value['min']} .. {value['max']}")
+                        else:
+                            log(test_result, f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                    elif isinstance(value, bool):
+                        unsup = " (not supported)" if (is_settings_list and value is False and key != "status") else ""
+                        log(test_result, f"{key}: {str(value).lower()}{unsup}")
+                    else:
+                        log(test_result, f"{key}: {value}")
+                except Exception:
+                    log(test_result, f"{key}: {json.dumps(value, default=str, ensure_ascii=False)}")
+        elif isinstance(clean_obj, list):
+            log(test_result, f"items: {len(clean_obj)} total")
+            for item in clean_obj[:25]:
+                log(test_result, f"  • {json.dumps(item, default=str, ensure_ascii=False)}")
+            if len(clean_obj) > 25:
+                log(test_result, f"  ... (+{len(clean_obj) - 25} more in raw response)")
+        else:
+            log(test_result, str(clean_obj))
+    except Exception:
+        log(test_result, str(obj))
 
 # Raised when preflight (discovery/health) decides we should stop the run.
 class PreflightTermination(Exception):
@@ -32,6 +572,7 @@ class DabTester:
         self.dab_checker = DabChecker(self)
         self.verbose = False
         self.dab_version = None  # Will be set by auto-detect logic
+        self.device_info = {}    # Captured at stage 1 before test execution
         self.override_dab_version = override_dab_version
         self.logger = LOGGER
         self.logger.verbose = self.verbose
@@ -42,15 +583,53 @@ class DabTester:
         except Exception as e:
             self.logger.error(f"Could not load 'valid_dab_topics.json'. The topic validation set is empty. Exception: {type(e).__name__}: {e}")
             self.valid_dab_topics = set()
+    def _capture_initial_device_info(self, device_id: str) -> dict:
+        """Fetch and cache device/info at Stage 1 before executing test cases."""
+        if self.device_info and self.device_info.get("deviceId") == device_id:
+            return self.device_info
+        info = self.get_device_info(device_id)
+        if info:
+            self.device_info = info
+            self.logger.result(
+                f"[DEVICE] {info.get('manufacturer', '?')} {info.get('model', '?')} "
+                f"(deviceId={info.get('deviceId', device_id)}, chipset={info.get('chipset', '?')}, "
+                f"fw={info.get('firmwareVersion', '?')} / {info.get('firmwareBuild', '?')})"
+            )
+        return self.device_info
+
+    def _extract_unsupported_item_label(self, topic: str, request_body) -> str:
+        """Extract specific item name (e.g. 'memc', 'KEY_RECORD', or operation topic) for per-item ack."""
+        req_obj = self._response_object(request_body)
+        if topic == "system/settings/set" and isinstance(req_obj, dict) and len(req_obj) == 1:
+            return next(iter(req_obj.keys()))
+        if topic in ("input/key-press", "input/long-key-press") and isinstance(req_obj, dict) and isinstance(req_obj.get("keyCode"), str):
+            return req_obj["keyCode"]
+        if topic == "voice/set" and isinstance(req_obj, dict) and isinstance(req_obj.get("voiceSystem"), dict):
+            return str(req_obj["voiceSystem"].get("name") or topic)
+        if topic.startswith("voice/") and isinstance(req_obj, dict) and isinstance(req_obj.get("voiceSystem"), str):
+            return req_obj["voiceSystem"]
+        return topic
+
+    def _acknowledge_optional_unsupported(self, test_result, topic: str, request_body="{}"):
+        """Prompt or reuse per-item acknowledgment when an operation/item is OPTIONAL_FAILED."""
+        if test_result is None:
+            return
+        item_label = self._extract_unsupported_item_label(topic, request_body)
+        AcknowledgeUnsupported(test_result, topic, [item_label])
+
     # -----------------------------
     # Core send/request wrapper
     # -----------------------------
-    def execute_cmd(self,device_id,dab_request_topic,dab_request_body="{}"):
-        self.dab_client.request(device_id,dab_request_topic,dab_request_body)
+    def _send_raw_cmd(self, device_id, dab_request_topic, dab_request_body="{}"):
+        """Send an unpatched DAB command so state capture/restore bypasses DabChecker adjustments."""
+        self.dab_client.request(device_id, dab_request_topic, dab_request_body)
         if self.dab_client.last_error_code() == 200:
             return 0
         else:
             return 1
+
+    def execute_cmd(self,device_id,dab_request_topic,dab_request_body="{}"):
+        return self._send_raw_cmd(device_id, dab_request_topic, dab_request_body)
 
     @staticmethod
     def _response_object(response):
@@ -81,7 +660,7 @@ class DabTester:
                 return None
 
             if topic == "system/power-mode/set":
-                if self.execute_cmd(device_id, "system/power-mode/get", "{}") != 0:
+                if self._send_raw_cmd(device_id, "system/power-mode/get", "{}") != 0:
                     log(test_result, "[WARN] Could not read the original power mode; restore skipped.")
                     return None
                 original = self._response_object(self.dab_client.response()).get("powerMode")
@@ -92,7 +671,7 @@ class DabTester:
                 return ("system/power-mode/set", json.dumps({"powerMode": original}), {"powerMode": original})
 
             if topic == "system/settings/set":
-                if self.execute_cmd(device_id, "system/settings/get", "{}") != 0:
+                if self._send_raw_cmd(device_id, "system/settings/get", "{}") != 0:
                     log(test_result, "[WARN] Could not read the original settings; restore skipped.")
                     return None
                 current = self._response_object(self.dab_client.response())
@@ -112,10 +691,10 @@ class DabTester:
             return
         topic, body, expected_values = restore_request
         try:
-            if self.execute_cmd(device_id, topic, body) == 0:
+            if self._send_raw_cmd(device_id, topic, body) == 0:
                 self.dab_client.response()  # Drain the restore response.
                 get_topic = "system/power-mode/get" if topic == "system/power-mode/set" else "system/settings/get"
-                if self.execute_cmd(device_id, get_topic, "{}") != 0:
+                if self._send_raw_cmd(device_id, get_topic, "{}") != 0:
                     log(test_result, f"[WARN] Restore request to '{topic}' succeeded, but verification could not read the current value.")
                     return
                 current = self._response_object(self.dab_client.response())
@@ -216,13 +795,19 @@ class DabTester:
 
         def do_discover():
             try:
-                return self.dab_client.discover_devices() or []
+                return self.dab_client.discover_devices(target_device_id=device_id) or []
             except Exception as e:
                 self.logger.error(f"Discovery did not complete. Reason: {e}")
                 return None  # signal hard failure
 
-        # 1) First attempt
+        # 1) First attempt (with non-interactive backoff retries matching pretest_health_check)
         discovered_list = do_discover()
+        if not interactive:
+            for _ in range(3):
+                if any((e.get("deviceId") or e.get("device_id")) == device_id for e in (discovered_list or [])):
+                    break
+                sleep(10)
+                discovered_list = do_discover()
         if discovered_list is None:
             # discovery call itself failed
             if not interactive:
@@ -472,13 +1057,36 @@ class DabTester:
         Full preflight: discovery then health-check.
         Raises PreflightTermination if we should stop the run.
         """
-        # 1) Discovery (hard gate; no prompt)
-        self._preflight_discovery_or_raise(device_id)
+        is_interactive = bool(getattr(sys.stdin, "isatty", lambda: False)()) and os.environ.get("DAB_NON_INTERACTIVE") != "1"
+        # 1) Discovery
+        self._preflight_discovery_or_raise(device_id, interactive=is_interactive)
 
-        # 2) Health-check (prompt allowed)
-        ok = self.pretest_health_check(device_id, retries=3, delay_sec=10, interactive=True, fatal=False)
+        # 2) Health-check
+        ok = self.pretest_health_check(device_id, retries=3, delay_sec=10, interactive=is_interactive, fatal=False)
         if not ok:
             raise PreflightTermination("Health-check failed; user chose to terminate.")
+
+    def _wait_for_reboot_recovery(self, device_id: str, initial_wait: int = 15, timeout_sec: int = 210):
+        """After system/restart, wait for the device to reboot and respond to discovery + health-check."""
+        self.logger.result(f"[INFO] Waiting {initial_wait}s for '{device_id}' to begin restarting...")
+        sleep(initial_wait)
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                self.dab_client.ensure_connected()
+                found = self.dab_client.discover_devices(attempts=1, wait_seconds=2.5, target_device_id=device_id) or []
+                if any((d.get("deviceId") or d.get("device_id")) == device_id for d in found):
+                    self.dab_client.request(device_id, "health-check/get", "{}")
+                    resp_text = self.dab_client.response() or ""
+                    if self.dab_client.last_error_code() == 200:
+                        j = self._response_object(resp_text)
+                        if j.get("healthy") is True:
+                            self.logger.result(f"[INFO] Device '{device_id}' recovered from restart and reported healthy.")
+                            return
+            except Exception:
+                pass
+            sleep(5)
+        self.logger.warn(f"[WARN] Device '{device_id}' did not confirm healthy within {timeout_sec}s after restart.")
 
     # -----------------------------
     # Main Execute for a single test
@@ -502,13 +1110,15 @@ class DabTester:
         try:
             if Version(dab_version) < Version(test_version):
                 reason = f"\033[1;33m[ OPTIONAL_FAILED - Requires DAB Version {test_version}, but device version is {dab_version} ]\033[0m"
-                return self._result_before_payload(
+                tr = self._result_before_payload(
                     outcome="OPTIONAL_FAILED",
                     device_id=device_id,
                     topic=dab_request_topic,
                     title=test_title,
                     reason=reason,
                 )
+                AcknowledgeUnsupported(tr, dab_request_topic, [f"{dab_request_topic} (requires DAB {test_version}, device is {dab_version})"])
+                return tr
         except InvalidVersion as e:
             self.logger.warn(f"[WARNING] Version comparison failed (invalid version string): {e}")
 
@@ -523,7 +1133,7 @@ class DabTester:
                 reason = "\033[1;33m[ OPTIONAL_FAILED - Required DAB Operation is NOT SUPPORTED by this device ]\033[0m"
                 if uncertain_install:
                     reason = "\033[1;33m[ OPTIONAL_FAILED - Required DAB Operation support could not be confirmed by this device ]\033[0m"
-                return self._result_before_payload(
+                tr = self._result_before_payload(
                     outcome="OPTIONAL_FAILED",
                     device_id=device_id,
                     topic=dab_request_topic,
@@ -531,6 +1141,8 @@ class DabTester:
                     reason=reason,
                     extra_logs=[prechecker_log],
                 )
+                self._acknowledge_optional_unsupported(tr, dab_request_topic)
+                return tr
 
         # Try to build/resolve payload. If it fails, return a SKIPPED TestResult (no test_start)
         ok, dab_request_body, skipped_tr = self._resolve_body_or_skip(device_id, dab_request_topic, test_title, body_spec)
@@ -565,11 +1177,6 @@ class DabTester:
             # Initialize result object for logging and reporting
             test_result = TestResult(to_test_id(f"{dab_request_topic}/{test_title}"), device_id, dab_request_topic, dab_request_body, "UNKNOWN", "", [])
 
-            if dab_request_topic in {"system/settings/set", "system/power-mode/set"}:
-                restore_request = self._capture_restore_request(
-                    device_id, dab_request_topic, dab_request_body, test_result
-                )
-
             # ------------------------------------------------------------------------
             # Capability filter 
             # Gate topics that depend on settings lists. If unsupported ⇒ OPTIONAL_FAILED.
@@ -584,12 +1191,18 @@ class DabTester:
                         if cap_log:
                             log(test_result, cap_log)
                         log(test_result, "\033[1;33m[ OPTIONAL_FAILED - Unsupported by device capability lists ]\033[0m")
+                        self._acknowledge_optional_unsupported(test_result, dab_request_topic, dab_request_body)
                         total_ms = int((time.time() - section_wall_start) * 1000)
                         self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
                         return test_result
             except Exception:
                 # do not alter flow on capability check errors; continue to existing checks
                 pass
+
+            if dab_request_topic in {"system/settings/set", "system/power-mode/set"}:
+                restore_request = self._capture_restore_request(
+                    device_id, dab_request_topic, dab_request_body, test_result
+                )
 
             # ------------------------------------------------------------------------
             # If precheck is supported and this is not a negative test case
@@ -602,6 +1215,14 @@ class DabTester:
                     test_result.test_result = "OPTIONAL_FAILED"
                     log(test_result, prechecker_log)
                     log(test_result, f"\033[1;33m[ OPTIONAL_FAILED ]\033[0m")
+                    self._acknowledge_optional_unsupported(test_result, dab_request_topic, dab_request_body)
+                    total_ms = int((time.time() - section_wall_start) * 1000)
+                    self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
+                    return test_result
+                req_ws_issues = _check_non_prose_whitespace(self._response_object(dab_request_body))
+                if req_ws_issues:
+                    test_result.test_result = "FAILED"
+                    log(test_result, f"[FAILED] Request {req_ws_issues[0]} (spaces are not supported in parameters).")
                     total_ms = int((time.time() - section_wall_start) * 1000)
                     self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
                     return test_result
@@ -617,7 +1238,13 @@ class DabTester:
                     code = self.execute_cmd(device_id, dab_request_topic, dab_request_body)
                     resp_text = self.dab_client.response() or ""
                     status_code = self.dab_client.last_error_code()
+                    if dab_request_topic == "system/settings/set":
+                        eff = getattr(self.dab_checker, "_last_effective_settings_payload", None)
+                        if eff:
+                            test_result.request = eff
                     test_result.response = resp_text
+                    test_result._raw_response_bytes = len(resp_text.encode("utf-8"))
+                    test_result._raw_status_code = status_code
                     # Topics whose responses are big/noisy (don’t store full response in JSON)
                     HEAVY_TOPICS = {"system/logs/stop-collection", "output/image"}
                     if dab_request_topic in HEAVY_TOPICS:
@@ -634,77 +1261,100 @@ class DabTester:
                     self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
                     return test_result
 
-                # If execution succeeded (error code 200)
-                if code == 0:
-                    end = datetime.datetime.now()
-                    durationInMs = int((end - start).total_seconds() * 1000)
+                end = datetime.datetime.now()
+                durationInMs = int((end - start).total_seconds() * 1000)
+                test_result._actual_latency_ms = durationInMs
+                test_result._expected_latency_ms = expected_response if isinstance(expected_response, int) else None
 
-                    try:
-                        validate_result = validate_output_function(test_result, durationInMs, expected_response)
-                        if validate_result == True:
-                            validate_result, checker_log = self.dab_checker.check(device_id, dab_request_topic, dab_request_body)
-                            if checker_log:
-                                log(test_result, checker_log)
-                        else:
-                            self.dab_checker.end_precheck(device_id, dab_request_topic, dab_request_body)
-                    except Exception as e:
-                        # If this is a negative test case and validation fails (e.g., 200 response with incorrect behavior),
-                        # treat it as PASS because failure was the expected outcome in this scenario.
-                        if is_negative:
-                            # For negative test: failure is expected — pass the test
-                            test_result.test_result = "PASS"
-                            log(test_result, f"\033[1;33m[ NEGATIVE TEST PASSED - Exception as Expected ]\033[0m {(e)}")
-                            total_ms = int((time.time() - section_wall_start) * 1000)
-                            self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
-                            return test_result
-                        else:
+                def _ensure_latency_logged():
+                    if isinstance(expected_response, int) and not any("Latency, Expected:" in str(ln) for ln in test_result.logs):
+                        log(test_result, f"{dab_request_topic} Latency, Expected: {expected_response} ms, Actual: {durationInMs} ms")
+
+                # Validate integer status field before branching
+                parsed_status_obj = self._response_object(resp_text)
+                raw_payload_status = parsed_status_obj.get("status") if isinstance(parsed_status_obj, dict) else None
+                invalid_status_type = (
+                    bool(resp_text)
+                    and (not isinstance(raw_payload_status, int) or isinstance(raw_payload_status, bool) or raw_payload_status not in VALID_DAB_STATUS_CODES)
+                )
+
+                # If execution succeeded (error code 200)
+                if invalid_status_type:
+                    _ensure_latency_logged()
+                    test_result.test_result = "FAILED"
+                    log(test_result, f"[FAILED] Invalid or unrecognized DAB response status: {raw_payload_status!r} (expected integer in {sorted(VALID_DAB_STATUS_CODES)}).")
+                elif code == 0:
+                    if is_negative and dab_request_topic not in {"applications/launch-with-content", "voice/send-audio"}:
+                        _ensure_latency_logged()
+                        test_result.test_result = "FAILED"
+                        log(test_result, "\033[1;31m[ FAILED - Negative test expected error status (400/404), but received 200 ]\033[0m")
+                    else:
+                        try:
+                            validate_result = validate_output_function(test_result, durationInMs, expected_response)
+                            if validate_result == True and not is_negative:
+                                validate_result, checker_log = self.dab_checker.check(device_id, dab_request_topic, dab_request_body)
+                                if checker_log:
+                                    log(test_result, checker_log)
+                            elif not is_negative:
+                                self.dab_checker.end_precheck(device_id, dab_request_topic, dab_request_body)
+                        except Exception as e:
+                            _ensure_latency_logged()
                             test_result.test_result = "SKIPPED"
                             log(test_result, f"\033[1;34m[ SKIPPED - Internal Error During Validation ]\033[0m {str(e)}")
                             total_ms = int((time.time() - section_wall_start) * 1000)
                             self.logger.test_end(outcome=test_result.test_result, duration_ms=total_ms)
                             return test_result
 
-                    if validate_result == True:
-                        test_result.test_result = "PASS"
-                        log(test_result, "\033[1;32m[ PASS ]\033[0m")
-                    else:
+                        _ensure_latency_logged()
                         if is_negative:
+                            if validate_result == True:
+                                test_result.test_result = "FAILED"
+                                log(test_result, "\033[1;31m[ FAILED - Negative test unexpectedly succeeded with 200 ]\033[0m")
+                            else:
+                                test_result.test_result = "PASS"
+                                log(test_result, "\033[1;33m[ NEGATIVE TEST PASSED - Validation Failed as Expected ]\033[0m")
+                        elif validate_result == True:
                             test_result.test_result = "PASS"
-                            log(test_result, "\033[1;33m[ NEGATIVE TEST PASSED - Validation Failed as Expected ]\033[0m")
+                            log(test_result, "\033[1;32m[ PASS ]\033[0m")
                         else:
                             test_result.test_result = "FAILED"
                             log(test_result, "\033[1;31m[ FAILED ]\033[0m")
                 else:
-                    # Handle non-200 error codes
+                    # Handle non-200 error codes (DAB §4.2 requires non-empty 'error' string on all non-200 responses)
+                    _ensure_latency_logged()
                     error_code = self.dab_client.last_error_code()
                     error_msg = self.dab_client.response()
+                    err_obj = self._response_object(error_msg)
+                    err_text = err_obj.get("error") if isinstance(err_obj, dict) else None
+                    has_valid_err_msg = isinstance(err_text, str) and bool(err_text.strip())
 
                     if is_negative and error_code in (400, 404):
-                        test_result.test_result = "PASS"
-                        log(test_result, f"\033[1;33m[ NEGATIVE TEST PASSED - Expected Error Code {error_code} ]\033[0m")
+                        if not has_valid_err_msg:
+                            test_result.test_result = "FAILED"
+                            log(test_result, f"\033[1;31m[ FAILED - HTTP {error_code} response missing non-empty 'error' explanation per DAB spec ]\033[0m")
+                        else:
+                            test_result.test_result = "PASS"
+                            log(test_result, f"\033[1;33m[ NEGATIVE TEST PASSED - Expected Error Code {error_code} ]\033[0m")
                     elif error_code == 501:
-                        # ------------------------------------------------------------------------------
-                        # Handle 501 Not Implemented:
-                        # If the operation is listed in dab/operations/list but not implemented,
-                        # it is treated as a hard failure — this indicates a declared operation
-                        # is missing implementation.
-                        # If the operation is not listed in the supported list, mark as OPTIONAL_FAILED.
-                        # ------------------------------------------------------------------------------
-                        # Check if operation is listed in dab/operations/list
                         supported_code, op_check_log = self.dab_checker.is_operation_supported(device_id, dab_request_topic)
-                        if supported_code == ValidateCode.SUPPORT:
+                        if not has_valid_err_msg:
+                            test_result.test_result = "FAILED"
+                            log(test_result, "\033[1;31m[ FAILED - HTTP 501 response missing non-empty 'error' explanation per DAB spec ]\033[0m")
+                        elif supported_code == ValidateCode.SUPPORT:
                             test_result.test_result = "FAILED"
                             log(test_result, op_check_log)
                             log(test_result, f"\033[1;31m[ FAILED - Required DAB operation is NOT IMPLEMENTED (501) ]\033[0m")
                         else:
                             test_result.test_result = "OPTIONAL_FAILED"
                             log(test_result, f"\033[1;33m[ OPTIONAL_FAILED - Operation may not be mandatory, received 501 ]\033[0m")
-
+                            self._acknowledge_optional_unsupported(test_result, dab_request_topic, dab_request_body)
                     elif error_code == 500:
-                        # 500 Internal Server Error: Indicates a crash or failure not caused by the test itself.
-                        # Marked as SKIPPED to avoid counting it as a hard failure.
-                        test_result.test_result = "SKIPPED"
-                        log(test_result, f"\033[1;34m[ SKIPPED - Internal Error Code {error_code} ]\033[0m {error_msg}")
+                        if not has_valid_err_msg:
+                            test_result.test_result = "FAILED"
+                            log(test_result, "\033[1;31m[ FAILED - HTTP 500 response missing non-empty 'error' explanation per DAB spec ]\033[0m")
+                        else:
+                            test_result.test_result = "SKIPPED"
+                            log(test_result, f"\033[1;34m[ SKIPPED - Internal Error Code {error_code} ]\033[0m {error_msg}")
                     else:
                         # All other non-zero error codes indicate test failure.
                         test_result.test_result = "FAILED"
@@ -716,68 +1366,14 @@ class DabTester:
                 test_result.test_result = "SKIPPED"
                 log(test_result, f"\033[1;34m[ SKIPPED - Internal Error ]\033[0m {str(e)}")
             if dab_request_topic not in {"system/logs/stop-collection", "output/image"} and resp_text:
-                try:
-                    text = str(resp_text)  # no trimming
-
-                    # If response looks like "['{', 'status: 200', ...]" try to merge it to JSON text
-                    if text.startswith('[') and text.endswith(']'):
-                        import ast
-                        try:
-                            chunks = ast.literal_eval(text)
-                            if isinstance(chunks, list):
-                                text = " ".join(str(x) for x in chunks if str(x))
-                        except Exception:
-                            pass
-
-                    obj = json.loads(text)
-
-                    if isinstance(obj, dict):
-                        for key, value in obj.items():
-                            if isinstance(value, list):
-                                # No index for sub-items; print one line per value
-                                for item in value:
-                                    log(test_result, f"{key}: {item}")
-                            elif isinstance(value, dict):
-                                # Flatten one level without indices
-                                for sub_key, sub_val in value.items():
-                                    log(test_result, f"{key}.{sub_key}: {sub_val}")
-                            else:
-                                log(test_result, f"{key}: {value}")
-
-                    elif isinstance(obj, list):
-                        # Index only for the MAIN (top-level) list items
-                        for i, item in enumerate(obj):
-                            if isinstance(item, dict):
-                                for key, value in item.items():
-                                    if isinstance(value, list):
-                                        for sub_item in value:
-                                            log(test_result, f"item[{i}].{key}: {sub_item}")  # no sub-index
-                                    elif isinstance(value, dict):
-                                        for sub_key, sub_val in value.items():
-                                            log(test_result, f"item[{i}].{key}.{sub_key}: {sub_val}")  # no sub-index
-                                    else:
-                                        log(test_result, f"item[{i}].{key}: {value}")
-                            elif isinstance(item, list):
-                                # Nested list: repeat the same main index for each inner value (no sub-index)
-                                for sub_item in item:
-                                    log(test_result, f"item[{i}]: {sub_item}")
-                            else:
-                                log(test_result, f"item[{i}]: {item}")
-
-                    else:
-                        # Primitive (str/number/bool/null)
-                        log(test_result, str(obj))
-
-                except Exception:
-                    # Fallbacks: if we had chunk tokens, print each as a separate line; else raw text
+                parsed_resp = self._response_object(resp_text)
+                if parsed_resp:
+                    _format_response_for_logs(test_result, dab_request_topic, parsed_resp)
+                else:
                     try:
-                        if 'chunks' in locals() and isinstance(chunks, list):
-                            for chunk in chunks:
-                                log(test_result, str(chunk))
-                        else:
-                            log(test_result, resp_text)
+                        _format_response_for_logs(test_result, dab_request_topic, json.loads(str(resp_text)))
                     except Exception:
-                        log(test_result, resp_text)
+                        log(test_result, str(_parse_native_json_or_str(resp_text)))
 
 
 
@@ -799,11 +1395,15 @@ class DabTester:
                 except Exception:
                     pass
             # Always try to go back Home after the test, regardless of outcome/early return/exception.
-            try:
-                self.return_to_home_after_test(device_id)
-            except Exception:
-                # best-effort cleanup; never let this affect runner flow
-                pass
+            if dab_request_topic == "system/restart":
+                if test_result is not None and test_result.test_result == "PASS":
+                    self._wait_for_reboot_recovery(device_id)
+            else:
+                try:
+                    self.return_to_home_after_test(device_id)
+                except Exception:
+                    # best-effort cleanup; never let this affect runner flow
+                    pass
 
     def Execute_Functional_Tests(self, device_id, functional_tests, test_result_output_path=""):
         """
@@ -816,6 +1416,7 @@ class DabTester:
         total_count = len(functional_tests)
         suite_wall_start = time.time()
         dab_version = self.dab_version  # Get the device's DAB version once
+        device_info = self._capture_initial_device_info(device_id)
 
         for idx, test_case in enumerate(functional_tests, 1):
             try:
@@ -959,7 +1560,7 @@ class DabTester:
         if not test_result_output_path:
             test_result_output_path = "./test_result/functional_result.json"
 
-        device_info = self.get_device_info(device_id)
+        device_info = device_info or self.device_info or self.get_device_info(device_id)
         total_wall_ms = int((time.time() - suite_wall_start) * 1000)
         self.write_test_result_json("functional", result_list, test_result_output_path, device_info=device_info, total_wall_ms=total_wall_ms)
 
@@ -970,8 +1571,11 @@ class DabTester:
     # Conformance (suite) runner
     # -----------------------------
     def Execute_All_Tests(self, suite_name, device_id, Test_Set, test_result_output_path):
+        global _INTERACTIVE_ACK_ENABLED
+        _INTERACTIVE_ACK_ENABLED = True
         if not self.dab_version:
             self.detect_dab_version(device_id)
+        device_info = self._capture_initial_device_info(device_id)
 
         if suite_name == "functional":
             self.Execute_Functional_Tests(device_id, Test_Set, test_result_output_path)
@@ -1002,7 +1606,7 @@ class DabTester:
 
         if (len(test_result_output_path) == 0):
             test_result_output_path = f"./test_result/{suite_name}.json"
-        device_info = self.get_device_info(device_id)
+        device_info = device_info or self.device_info or self.get_device_info(device_id)
         total_wall_ms = int((time.time() - suite_wall_start) * 1000)
         self.write_test_result_json(suite_name, result_list.test_result_list, test_result_output_path, device_info = device_info, total_wall_ms=total_wall_ms)
 
@@ -1010,8 +1614,11 @@ class DabTester:
     # Single test runner
     # -----------------------------
     def Execute_Single_Test(self, suite_name, device_id, test_case_or_cases, test_result_output_path=""):
+        global _INTERACTIVE_ACK_ENABLED
+        _INTERACTIVE_ACK_ENABLED = True
         if not self.dab_version:
             self.detect_dab_version(device_id)
+        device_info = self._capture_initial_device_info(device_id)
 
         if suite_name == "functional":
             self.Execute_Functional_Tests(device_id, test_case_or_cases, test_result_output_path)
@@ -1033,7 +1640,7 @@ class DabTester:
 
         if len(test_result_output_path) == 0:
             test_result_output_path = f"./test_result/{suite_name}_single.json"
-        device_info = self.get_device_info(device_id)
+        device_info = device_info or self.device_info or self.get_device_info(device_id)
         total_wall_ms = int((time.time() - suite_wall_start) * 1000)
         self.write_test_result_json(suite_name, result_list.test_result_list, test_result_output_path, device_info = device_info, total_wall_ms=total_wall_ms)
 
@@ -1056,7 +1663,11 @@ class DabTester:
         os.environ["DAB_RESULTS_JSON"] = os.path.abspath(output_path)
 
         def _outcome_of(r):
-            return getattr(r, "test_result", None) or getattr(r, "outcome", None) or ""
+            tr_val = getattr(r, "test_result", None)
+            if isinstance(tr_val, str) and tr_val and tr_val != "UNKNOWN":
+                return tr_val
+            out_val = getattr(r, "outcome", None)
+            return out_val if isinstance(out_val, str) else ""
 
         # Keep only well-formed TestResult objects
         valid_results = []
@@ -1137,8 +1748,38 @@ class DabTester:
 
         # -------------------------------------------------------------------------------
 
-        # Clean only valid results so what we write is tidy (keep logs!)
-        self.clean_result_fields(valid_results, fields_to_clean=["request", "response"])
+        ansi_re = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+        serialized_results = []
+        ack_by_operation = {}
+
+        for t in valid_results:
+            verdict = _outcome_of(t) or "UNKNOWN"
+            topic = getattr(t, "operation", "") or ""
+            ack_obj = getattr(t, "operation_not_supported_ack", None)
+            if isinstance(ack_obj, dict) and ack_obj:
+                bucket = ack_by_operation.setdefault(topic, {})
+                bucket.update(ack_obj)
+            clean_logs = [
+                ansi_re.sub("", str(ln)).strip()
+                for ln in (getattr(t, "logs", None) or [])
+                if ansi_re.sub("", str(ln)).strip()
+            ]
+            outcome_summary = _build_outcome_summary(t, verdict, clean_logs)
+            t.outcome = outcome_summary
+            response_json_val = _prepare_response_for_json(
+                t, topic, getattr(t, "response", ""), clean_logs, logger=self.logger
+            )
+            serialized_results.append({
+                "test_id": t.test_id,
+                "device_id": t.device_id,
+                "operation": topic,
+                "test_result": verdict,
+                "outcome": outcome_summary,
+                "operation_not_supported_ack": ack_obj,
+                "request": _parse_native_json_or_str(getattr(t, "request", "{}")),
+                "response": response_json_val,
+                "logs": clean_logs,
+            })
 
         # Counts must match what we write
         total = len(valid_results)
@@ -1147,19 +1788,22 @@ class DabTester:
         optional_failed = sum(1 for t in valid_results if _outcome_of(t) == "OPTIONAL_FAILED")
         skipped = sum(1 for t in valid_results if _outcome_of(t) == "SKIPPED")
 
+        final_device_info = device_info if device_info else (self.device_info or {})
         result_data = {
             "test_version": get_test_tool_version(),
             "suite_name": suite_name,
-            "device_info": device_info if device_info else {},
+            "dab_version": self.dab_version or DAB_VERSION,
+            "device_info": final_device_info,
             "result_summary": {
                 "tests_executed": total,
                 "tests_passed": passed,
                 "tests_failed": failed,
                 "tests_optional_failed": optional_failed,
                 "tests_skipped": skipped,
-                "overall_passed": (failed == 0 and skipped == 0)
+                "overall_passed": (failed == 0 and skipped == 0),
             },
-            "test_result_list": valid_results
+            "operation_not_supported_ack": ack_by_operation,
+            "test_result_list": serialized_results,
         }
         overall_ok = (failed == 0 and skipped == 0)
         self.logger.result("══════════════════════════════════════════════════════════════════════════════")
@@ -1168,7 +1812,6 @@ class DabTester:
                 pretty = self.logger._fmt_duration(total_wall_ms)
                 self.logger.result(f"Total Time: {pretty} ({int(total_wall_ms)} ms)")
             except Exception:
-                # fallback just in case
                 self.logger.result(f"Total Time: {int(total_wall_ms)} ms")
         self.logger.result("Final Results Summary")
         self.logger.result(f"Suite Summary: {suite_name}")
@@ -1180,9 +1823,9 @@ class DabTester:
         self.logger.result(f"Overall Passed  : {'YES' if overall_ok else 'NO'}")
         self.logger.result("══════════════════════════════════════════════════════════════════════════════")
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             with open(output_path, "w", encoding="utf-8") as f:
-                # Beautify using jsons and indent=4 passed through jdkwargs
-                f.write(jsons.dumps(result_data, jdkwargs={"indent": 4}))
+                f.write(_dumps_result_document(result_data) + "\n")
             self.logger.ok(f"Saved the results JSON at {os.path.abspath(output_path)}.")
             return os.path.abspath(output_path)
 
@@ -1265,27 +1908,39 @@ class DabTester:
             self.logger.info(f"Using the forced DAB version override: {self.dab_version}.")
             return
         try:
-            self.dab_client.request(device_id, "version", "{}")
+            self.dab_client.request(device_id, "version", "{}", timeout=10)
             response = self.dab_client.response()
 
             if response:
                 resp_json = json.loads(response)
-                self.dab_version = resp_json.get("DAB Version", "2.0")
+                versions = resp_json.get("versions")
+                valid_versions = [
+                    v.strip() for v in (versions if isinstance(versions, list) else [])
+                    if isinstance(v, str) and re.match(r"^\d+\.\d+$", v.strip())
+                ]
+                if valid_versions:
+                    self.dab_version = max(valid_versions, key=Version)
+                elif isinstance(resp_json.get("DAB Version"), str) and resp_json["DAB Version"].strip():
+                    self.dab_version = resp_json["DAB Version"].strip()
+                else:
+                    self.dab_version = "2.0"
                 DAB_VERSION = self.dab_version
                 self.logger.info(f"DAB version detected: {self.dab_version}.")
             else:
                 self.logger.warn("The DAB version check returned an empty response. Defaulting to 2.0.")
                 self.dab_version = "2.0"
+                DAB_VERSION = "2.0"
 
         except Exception as e:
             self.logger.error(f"Could not detect the DAB version due to an error: {e}. Defaulting to 2.0.")
             self.dab_version = "2.0"
+            DAB_VERSION = "2.0"
 
     def get_device_info(self, device_id):
         try:
-            self.dab_client.request(device_id, "device/info", "{}")
+            self.dab_client.request(device_id, "device/info", "{}", timeout=10)
             response = self.dab_client.response()
-            if response:
+            if response and self.dab_client.last_error_code() == 200:
                 device_info = json.loads(response)
 
                 # Extract only the required fields
@@ -1341,7 +1996,7 @@ class DabTester:
         """Ensure `device_id` is reachable via discovery (no health-check fallback)."""
         self.logger.info("Preflight: discovering devices to confirm the target is online.")
         try:
-            devices = self.dab_client.discover_devices() or []
+            devices = self.dab_client.discover_devices(target_device_id=device_id) or []
         except Exception as e:
             self.logger.warn(f"Discovery did not complete due to an error: {e}")
             devices = []
@@ -1386,7 +2041,7 @@ class DabTester:
         Swallows errors; adds a short log line if provided.
         """
         try:
-            self.execute_cmd(device_id, "input/key-press", json.dumps({"keyCode": "KEY_HOME"}))
+            self.dab_client.request(device_id, "input/key-press", json.dumps({"keyCode": "KEY_HOME"}), timeout=5)
             _ = self.dab_client.response()  # drain response if any
             time.sleep(delay)
             if logs is not None:
@@ -1445,6 +2100,11 @@ def log(test_result, str_print):
         test_result.logs.append(clean)
 
 def YesNoQuestion(test_result, question=""):
+    """Prompt interactive operator for Y/N confirmation, or auto-confirm in non-TTY/automated runs."""
+    if not getattr(sys.stdin, "isatty", lambda: False)() or os.environ.get("DAB_NON_INTERACTIVE") == "1":
+        log(test_result, f"[AUTO] Non-interactive session; auto-confirming prompt: {question}")
+        return True
+
     positive = ['yes', 'y']
     negative = ['no', 'n']
 
